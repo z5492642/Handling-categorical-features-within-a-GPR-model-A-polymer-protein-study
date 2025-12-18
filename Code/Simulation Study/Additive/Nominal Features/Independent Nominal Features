@@ -1,0 +1,835 @@
+# One nominal feature
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fmin_l_bfgs_b
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def encode_categories(df, categorical_cols):
+    Z_lists, lookups = [], {}
+    for col in categorical_cols:
+        codes, uniques = pd.factorize(df[col], sort=True)
+        Z_lists.append(codes.astype(int))
+        lookups[col] = dict(enumerate(uniques))
+    return Z_lists, lookups
+
+def angles_to_T(theta, b):
+    L = np.zeros((b, b))
+    L[0, 0] = 1.0
+    idx = 0
+    for r in range(1, b):
+        row = theta[idx: idx + r]
+        idx += r
+        sin_p = 1.0
+        for k in range(r):
+            L[r, k] = sin_p * np.cos(row[k])
+            sin_p *= np.sin(row[k])
+        L[r, r] = sin_p
+    return L @ L.T
+
+def rbf_kernel(x1, x2, l):
+    l = np.array(l)
+    x1 = x1.reshape(1, -1) if x1.ndim == 1 else x1
+    x2 = x2.reshape(1, -1) if x2.ndim == 1 else x2
+    diff = (x1[:, None, :] - x2[None, :, :]) ** 2
+    scaled = diff / (2 * (l**2))
+    return np.exp(-np.sum(scaled, axis=-1))
+
+def build_cov_additive(X_pair, Z_pair, params, shapes):
+    d, q, b_list = shapes['d'], shapes['q'], shapes['b_list']
+    m_list = [b*(b-1)//2 for b in b_list]
+    p = 0
+    sigmas = params[p : p + q]; p += q
+    Ls = []
+    for _ in range(q):
+        Ls.append(params[p : p + d]); p += d
+    Tmats = []
+    for b, m in zip(b_list, m_list):
+        Tmats.append(angles_to_T(params[p : p + m], b)); p += m
+    var_n = params[-1]
+    X1, X2 = X_pair; Z1, Z2 = Z_pair
+    n1, n2 = len(X1), len(X2)
+    K = np.zeros((n1, n2))
+    for j in range(q):
+        Rj = rbf_kernel(X1, X2, Ls[j])
+        tau = Tmats[j][Z1[j]][:, Z2[j]]
+        K += (sigmas[j]**2) * Rj * tau
+    return K, var_n
+
+def nll_additive(params, X_num, Z_lists, y, shapes):
+    K, var_n = build_cov_additive((X_num, X_num), (Z_lists, Z_lists), params, shapes)
+    K[np.diag_indices_from(K)] += var_n
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    n = len(y)
+    return 0.5 * (y.T @ alpha + logdet + n * np.log(2 * np.pi))[0]
+
+def gp_predict_additive(params, X_train, Z_train, y_train, X_test, Z_test, shapes):
+    Kxx, var_n = build_cov_additive((X_train, X_train), (Z_train, Z_train), params, shapes)
+    Kxx[np.diag_indices_from(Kxx)] += var_n
+    L = np.linalg.cholesky(Kxx)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+    Kxs, _ = build_cov_additive((X_train, X_test), (Z_train, Z_test), params, shapes)
+    mu = (Kxs.T @ alpha).ravel()
+    return mu
+
+'''
+def multi_start_optimize(n_restarts, x0, bounds, objective_fn, args,
+                         maxiter=500, factr=1e7, pgtol=1e-8):
+    best_nll = np.inf; best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = np.minimum(np.maximum(x0 + np.random.randn(*x0.shape)*0.1, lower), upper)
+        theta_i, nll_i, info = fmin_l_bfgs_b(
+            objective_fn, x0_i, args=args, approx_grad=True,
+            bounds=bounds, maxiter=maxiter, factr=factr, pgtol=pgtol
+        )
+        if nll_i < best_nll:
+            best_nll, best_theta, best_info = nll_i, theta_i, info
+    print(f"Best NLL: {best_nll:.4f}, Converged: {best_info['warnflag']==0}")
+    return best_theta
+'''
+
+def multi_start_optimize(x0, bounds, objective_fn, args,
+                         maxiter=500, factr=1e7, pgtol=1e-8):
+    # ignore n_restarts, do exactly one optimization from x0
+    theta, nll, info = fmin_l_bfgs_b(
+        objective_fn, x0, args=args, approx_grad=True,
+        bounds=bounds, maxiter=maxiter, factr=factr, pgtol=pgtol
+    )
+    print(f"NLL: {nll:.4f}, Converged: {info['warnflag']==0}")
+    return theta
+
+
+def run_one_simulation_additive(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("1_nominal_features_low_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & shapes
+    categorical_cols = ['cat1']
+    Z_lists, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+    shapes = {
+      'd': X_all.shape[1],
+      'q': len(categorical_cols),
+      'b_list': b_list
+    }
+
+    # 3) Init hyperparams & bounds
+    m_list = [b*(b-1)//2 for b in b_list]
+    x0 = []
+    x0 += [1.0]*len(b_list)                           # σ's
+    x0 += list(np.ones(shapes['d'])*0.5)*len(b_list)  # lengthscales
+    x0 += [0.5]*sum(m_list)                           # angles
+    x0 += [1e-3]                                      # noise
+    x0 = np.array(x0)
+
+    sigma_bounds = [(1e-6,None)] * len(b_list)
+    feature_ranges = X_all.max(axis=0) - X_all.min(axis=0)
+    ls_bounds = []
+    for _ in b_list:
+        for rng in feature_ranges:
+            ls_bounds.append((1e-6, float(rng)))
+    theta_bounds = [(1e-4, np.pi-1e-4)] * sum(m_list)
+    bounds = sigma_bounds + ls_bounds + theta_bounds + [(1e-6,None)]
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Z_lists[j][tr] for j in range(shapes['q'])]
+        Z_te = [Z_lists[j][te] for j in range(shapes['q'])]
+
+        theta_hat = multi_start_optimize(
+            x0, bounds, nll_additive,
+            args=(X_tr, Z_tr, y_tr, shapes)
+        )
+        y_pred = gp_predict_additive(
+            theta_hat, X_tr, Z_tr, y_tr, X_te, Z_te, shapes
+        )
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Additive-1 nominal feature low levels 100 points.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Additive-1 nominal feature low levels - 100 points ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_additive(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+
+def run_one_simulation_additive(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("1_nominal_features_high_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & shapes
+    categorical_cols = ['cat1']
+    Z_lists, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+    shapes = {
+      'd': X_all.shape[1],
+      'q': len(categorical_cols),
+      'b_list': b_list
+    }
+
+    # 3) Init hyperparams & bounds
+    m_list = [b*(b-1)//2 for b in b_list]
+    x0 = []
+    x0 += [1.0]*len(b_list)                           # σ's
+    x0 += list(np.ones(shapes['d'])*0.5)*len(b_list)  # lengthscales
+    x0 += [0.5]*sum(m_list)                           # angles
+    x0 += [1e-3]                                      # noise
+    x0 = np.array(x0)
+
+    sigma_bounds = [(1e-6,None)] * len(b_list)
+    feature_ranges = X_all.max(axis=0) - X_all.min(axis=0)
+    ls_bounds = []
+    for _ in b_list:
+        for rng in feature_ranges:
+            ls_bounds.append((1e-6, float(rng)))
+    theta_bounds = [(1e-4, np.pi-1e-4)] * sum(m_list)
+    bounds = sigma_bounds + ls_bounds + theta_bounds + [(1e-6,None)]
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Z_lists[j][tr] for j in range(shapes['q'])]
+        Z_te = [Z_lists[j][te] for j in range(shapes['q'])]
+
+        theta_hat = multi_start_optimize(
+            x0, bounds, nll_additive,
+            args=(X_tr, Z_tr, y_tr, shapes)
+        )
+        y_pred = gp_predict_additive(
+            theta_hat, X_tr, Z_tr, y_tr, X_te, Z_te, shapes
+        )
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Additive-1 nominal feature high levels 100 points.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Additive-1 nominal feature high levels - 100 points ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_additive(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+# Four nominal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fmin_l_bfgs_b
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def encode_categories(df, categorical_cols):
+    Z_lists, lookups = [], {}
+    for col in categorical_cols:
+        codes, uniques = pd.factorize(df[col], sort=True)
+        Z_lists.append(codes.astype(int))
+        lookups[col] = dict(enumerate(uniques))
+    return Z_lists, lookups
+
+def angles_to_T(theta, b):
+    L = np.zeros((b, b))
+    L[0, 0] = 1.0
+    idx = 0
+    for r in range(1, b):
+        row = theta[idx: idx + r]
+        idx += r
+        sin_p = 1.0
+        for k in range(r):
+            L[r, k] = sin_p * np.cos(row[k])
+            sin_p *= np.sin(row[k])
+        L[r, r] = sin_p
+    return L @ L.T
+
+def rbf_kernel(x1, x2, l):
+    l = np.array(l)
+    x1 = x1.reshape(1, -1) if x1.ndim == 1 else x1
+    x2 = x2.reshape(1, -1) if x2.ndim == 1 else x2
+    diff = (x1[:, None, :] - x2[None, :, :]) ** 2
+    scaled = diff / (2 * (l**2))
+    return np.exp(-np.sum(scaled, axis=-1))
+
+def build_cov_additive(X_pair, Z_pair, params, shapes):
+    d, q, b_list = shapes['d'], shapes['q'], shapes['b_list']
+    m_list = [b*(b-1)//2 for b in b_list]
+    p = 0
+    sigmas = params[p : p + q]; p += q
+    Ls = []
+    for _ in range(q):
+        Ls.append(params[p : p + d]); p += d
+    Tmats = []
+    for b, m in zip(b_list, m_list):
+        Tmats.append(angles_to_T(params[p : p + m], b)); p += m
+    var_n = params[-1]
+    X1, X2 = X_pair; Z1, Z2 = Z_pair
+    n1, n2 = len(X1), len(X2)
+    K = np.zeros((n1, n2))
+    for j in range(q):
+        Rj = rbf_kernel(X1, X2, Ls[j])
+        tau = Tmats[j][Z1[j]][:, Z2[j]]
+        K += (sigmas[j]**2) * Rj * tau
+    return K, var_n
+
+def nll_additive(params, X_num, Z_lists, y, shapes):
+    K, var_n = build_cov_additive((X_num, X_num), (Z_lists, Z_lists), params, shapes)
+    K[np.diag_indices_from(K)] += var_n
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    n = len(y)
+    return 0.5 * (y.T @ alpha + logdet + n * np.log(2 * np.pi))[0]
+
+def gp_predict_additive(params, X_train, Z_train, y_train, X_test, Z_test, shapes):
+    Kxx, var_n = build_cov_additive((X_train, X_train), (Z_train, Z_train), params, shapes)
+    Kxx[np.diag_indices_from(Kxx)] += var_n
+    L = np.linalg.cholesky(Kxx)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+    Kxs, _ = build_cov_additive((X_train, X_test), (Z_train, Z_test), params, shapes)
+    mu = (Kxs.T @ alpha).ravel()
+    return mu
+
+'''
+def multi_start_optimize(n_restarts, x0, bounds, objective_fn, args,
+                         maxiter=500, factr=1e7, pgtol=1e-8):
+    best_nll = np.inf; best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = np.minimum(np.maximum(x0 + np.random.randn(*x0.shape)*0.1, lower), upper)
+        theta_i, nll_i, info = fmin_l_bfgs_b(
+            objective_fn, x0_i, args=args, approx_grad=True,
+            bounds=bounds, maxiter=maxiter, factr=factr, pgtol=pgtol
+        )
+        if nll_i < best_nll:
+            best_nll, best_theta, best_info = nll_i, theta_i, info
+    print(f"Best NLL: {best_nll:.4f}, Converged: {best_info['warnflag']==0}")
+    return best_theta
+'''
+
+def multi_start_optimize(x0, bounds, objective_fn, args,
+                         maxiter=500, factr=1e7, pgtol=1e-8):
+    # ignore n_restarts, do exactly one optimization from x0
+    theta, nll, info = fmin_l_bfgs_b(
+        objective_fn, x0, args=args, approx_grad=True,
+        bounds=bounds, maxiter=maxiter, factr=factr, pgtol=pgtol
+    )
+    print(f"NLL: {nll:.4f}, Converged: {info['warnflag']==0}")
+    return theta
+
+
+def run_one_simulation_additive(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("4_independent_nominal_features_low_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & shapes
+    categorical_cols = ['cat1','cat2','cat3','cat4']
+    Z_lists, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+    shapes = {
+      'd': X_all.shape[1],
+      'q': len(categorical_cols),
+      'b_list': b_list
+    }
+
+    # 3) Init hyperparams & bounds
+    m_list = [b*(b-1)//2 for b in b_list]
+    x0 = []
+    x0 += [1.0]*len(b_list)                           # σ's
+    x0 += list(np.ones(shapes['d'])*0.5)*len(b_list)  # lengthscales
+    x0 += [0.5]*sum(m_list)                           # angles
+    x0 += [1e-3]                                      # noise
+    x0 = np.array(x0)
+
+    sigma_bounds = [(1e-6,None)] * len(b_list)
+    feature_ranges = X_all.max(axis=0) - X_all.min(axis=0)
+    ls_bounds = []
+    for _ in b_list:
+        for rng in feature_ranges:
+            ls_bounds.append((1e-6, float(rng)))
+    theta_bounds = [(1e-4, np.pi-1e-4)] * sum(m_list)
+    bounds = sigma_bounds + ls_bounds + theta_bounds + [(1e-6,None)]
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Z_lists[j][tr] for j in range(shapes['q'])]
+        Z_te = [Z_lists[j][te] for j in range(shapes['q'])]
+
+        theta_hat = multi_start_optimize(
+            x0, bounds, nll_additive,
+            args=(X_tr, Z_tr, y_tr, shapes)
+        )
+        y_pred = gp_predict_additive(
+            theta_hat, X_tr, Z_tr, y_tr, X_te, Z_te, shapes
+        )
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 2
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Additive-4independent nominal features low levels 100 points.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Additive-4independent nominal features low levels 100 points ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_additive(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+
+def run_one_simulation_additive(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("4_independent_nominal_features_high_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & shapes
+    categorical_cols = ['cat1','cat2','cat3','cat4']
+    Z_lists, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+    shapes = {
+      'd': X_all.shape[1],
+      'q': len(categorical_cols),
+      'b_list': b_list
+    }
+
+    # 3) Init hyperparams & bounds
+    m_list = [b*(b-1)//2 for b in b_list]
+    x0 = []
+    x0 += [1.0]*len(b_list)                           # σ's
+    x0 += list(np.ones(shapes['d'])*0.5)*len(b_list)  # lengthscales
+    x0 += [0.5]*sum(m_list)                           # angles
+    x0 += [1e-3]                                      # noise
+    x0 = np.array(x0)
+
+    sigma_bounds = [(1e-6,None)] * len(b_list)
+    feature_ranges = X_all.max(axis=0) - X_all.min(axis=0)
+    ls_bounds = []
+    for _ in b_list:
+        for rng in feature_ranges:
+            ls_bounds.append((1e-6, float(rng)))
+    theta_bounds = [(1e-4, np.pi-1e-4)] * sum(m_list)
+    bounds = sigma_bounds + ls_bounds + theta_bounds + [(1e-6,None)]
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Z_lists[j][tr] for j in range(shapes['q'])]
+        Z_te = [Z_lists[j][te] for j in range(shapes['q'])]
+
+        theta_hat = multi_start_optimize(
+            x0, bounds, nll_additive,
+            args=(X_tr, Z_tr, y_tr, shapes)
+        )
+        y_pred = gp_predict_additive(
+            theta_hat, X_tr, Z_tr, y_tr, X_te, Z_te, shapes
+        )
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Additive-4independent nominal features high levels 100 points.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Additive-4independent nominal features high levels 100 points ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_additive(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+# Ten nominal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fmin_l_bfgs_b
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def encode_categories(df, categorical_cols):
+    Z_lists, lookups = [], {}
+    for col in categorical_cols:
+        codes, uniques = pd.factorize(df[col], sort=True)
+        Z_lists.append(codes.astype(int))
+        lookups[col] = dict(enumerate(uniques))
+    return Z_lists, lookups
+
+def angles_to_T(theta, b):
+    L = np.zeros((b, b))
+    L[0, 0] = 1.0
+    idx = 0
+    for r in range(1, b):
+        row = theta[idx: idx + r]
+        idx += r
+        sin_p = 1.0
+        for k in range(r):
+            L[r, k] = sin_p * np.cos(row[k])
+            sin_p *= np.sin(row[k])
+        L[r, r] = sin_p
+    return L @ L.T
+
+def rbf_kernel(x1, x2, l):
+    l = np.array(l)
+    x1 = x1.reshape(1, -1) if x1.ndim == 1 else x1
+    x2 = x2.reshape(1, -1) if x2.ndim == 1 else x2
+    diff = (x1[:, None, :] - x2[None, :, :]) ** 2
+    scaled = diff / (2 * (l**2))
+    return np.exp(-np.sum(scaled, axis=-1))
+
+def build_cov_additive(X_pair, Z_pair, params, shapes):
+    d, q, b_list = shapes['d'], shapes['q'], shapes['b_list']
+    m_list = [b*(b-1)//2 for b in b_list]
+    p = 0
+    sigmas = params[p : p + q]; p += q
+    Ls = []
+    for _ in range(q):
+        Ls.append(params[p : p + d]); p += d
+    Tmats = []
+    for b, m in zip(b_list, m_list):
+        Tmats.append(angles_to_T(params[p : p + m], b)); p += m
+    var_n = params[-1]
+    X1, X2 = X_pair; Z1, Z2 = Z_pair
+    n1, n2 = len(X1), len(X2)
+    K = np.zeros((n1, n2))
+    for j in range(q):
+        Rj = rbf_kernel(X1, X2, Ls[j])
+        tau = Tmats[j][Z1[j]][:, Z2[j]]
+        K += (sigmas[j]**2) * Rj * tau
+    return K, var_n
+
+def nll_additive(params, X_num, Z_lists, y, shapes):
+    K, var_n = build_cov_additive((X_num, X_num), (Z_lists, Z_lists), params, shapes)
+    K[np.diag_indices_from(K)] += var_n
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    n = len(y)
+    return 0.5 * (y.T @ alpha + logdet + n * np.log(2 * np.pi))[0]
+
+def gp_predict_additive(params, X_train, Z_train, y_train, X_test, Z_test, shapes):
+    Kxx, var_n = build_cov_additive((X_train, X_train), (Z_train, Z_train), params, shapes)
+    Kxx[np.diag_indices_from(Kxx)] += var_n
+    L = np.linalg.cholesky(Kxx)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+    Kxs, _ = build_cov_additive((X_train, X_test), (Z_train, Z_test), params, shapes)
+    mu = (Kxs.T @ alpha).ravel()
+    return mu
+
+'''
+def multi_start_optimize(n_restarts, x0, bounds, objective_fn, args,
+                         maxiter=500, factr=1e7, pgtol=1e-8):
+    best_nll = np.inf; best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = np.minimum(np.maximum(x0 + np.random.randn(*x0.shape)*0.1, lower), upper)
+        theta_i, nll_i, info = fmin_l_bfgs_b(
+            objective_fn, x0_i, args=args, approx_grad=True,
+            bounds=bounds, maxiter=maxiter, factr=factr, pgtol=pgtol
+        )
+        if nll_i < best_nll:
+            best_nll, best_theta, best_info = nll_i, theta_i, info
+    print(f"Best NLL: {best_nll:.4f}, Converged: {best_info['warnflag']==0}")
+    return best_theta
+'''
+
+def multi_start_optimize(x0, bounds, objective_fn, args,
+                         maxiter=500, factr=1e7, pgtol=1e-8):
+    # ignore n_restarts, do exactly one optimization from x0
+    theta, nll, info = fmin_l_bfgs_b(
+        objective_fn, x0, args=args, approx_grad=True,
+        bounds=bounds, maxiter=maxiter, factr=factr, pgtol=pgtol
+    )
+    #print(f"NLL: {nll:.4f}, Converged: {info['warnflag']==0}")
+    return theta
+
+
+def run_one_simulation_additive(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("10_independent_nominal_features.csv")
+    X_all = df[['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & shapes
+    categorical_cols = ['cat1','cat2','cat3','cat4', 'cat5','cat6','cat7','cat8', 'cat9','cat10']
+    Z_lists, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+    shapes = {
+      'd': X_all.shape[1],
+      'q': len(categorical_cols),
+      'b_list': b_list
+    }
+
+    # 3) Init hyperparams & bounds
+    m_list = [b*(b-1)//2 for b in b_list]
+    x0 = []
+    x0 += [1.0]*len(b_list)                           # σ's
+    x0 += list(np.ones(shapes['d'])*0.5)*len(b_list)  # lengthscales
+    x0 += [0.5]*sum(m_list)                           # angles
+    x0 += [1e-3]                                      # noise
+    x0 = np.array(x0)
+
+    sigma_bounds = [(1e-6,None)] * len(b_list)
+    feature_ranges = X_all.max(axis=0) - X_all.min(axis=0)
+    ls_bounds = []
+    for _ in b_list:
+        for rng in feature_ranges:
+            ls_bounds.append((1e-6, float(rng)))
+    theta_bounds = [(1e-4, np.pi-1e-4)] * sum(m_list)
+    bounds = sigma_bounds + ls_bounds + theta_bounds + [(1e-6,None)]
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Z_lists[j][tr] for j in range(shapes['q'])]
+        Z_te = [Z_lists[j][te] for j in range(shapes['q'])]
+
+        theta_hat = multi_start_optimize(
+            x0, bounds, nll_additive,
+            args=(X_tr, Z_tr, y_tr, shapes)
+        )
+        y_pred = gp_predict_additive(
+            theta_hat, X_tr, Z_tr, y_tr, X_te, Z_te, shapes
+        )
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Additive-10independent nominal features.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Additive-10independent nominal features ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_additive(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
