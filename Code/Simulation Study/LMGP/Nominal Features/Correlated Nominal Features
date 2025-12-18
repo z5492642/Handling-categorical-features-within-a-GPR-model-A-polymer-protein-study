@@ -1,0 +1,785 @@
+# Two correlated features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+import plotly.graph_objects as go
+from sklearn.metrics import mean_squared_error, r2_score
+import os
+
+def rbf_kernel(x1, x2, var_f, l):
+    """
+    Squared‐exponential (RBF) kernel on continuous inputs.
+    """
+    l = np.array(l)
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+    diff2 = ( (x1[:, None, :] - x2[None, :, :]) ** 2 ) / (2 * l**2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def zeta_matrix(T, level_lists):
+    """
+    One‐hot (grouped) encoding of categorical matrix T.
+    level_lists[j] is array of unique levels (integer codes) for column j.
+    T: shape (n, J). Returns (n, sum(m_j)) dense one‐hot block.
+    """
+    T = np.atleast_2d(T)
+    blocks = []
+    for j, levels in enumerate(level_lists):
+        eye = np.eye(len(levels))
+        mapping = {lvl: eye[i] for i, lvl in enumerate(levels)}
+        blocks.append(np.vstack([mapping[v] for v in T[:, j]]))
+    return np.hstack(blocks)  # shape (n, m_total)
+
+def latent_positions(zeta, A):
+    return zeta @ A  # (n, d_z)
+
+def lmgp_kernel(Xc1, Tc1, Xc2, Tc2, var_f, A, cont_kernel, ell, level_lists):
+    """
+    LMGP covariance: K = var_f · K_cont(Xc1,Xc2) · K_latent(Tc1,Tc2)
+    Where K_latent uses squared‐exp on latent positions Z = ζ·A.
+    """
+    # continuous part
+    Kc = cont_kernel(Xc1, Xc2, 1.0, ell)  # will multiply var_f later
+    # latent part
+    Z1 = latent_positions(zeta_matrix(Tc1, level_lists), A)
+    Z2 = latent_positions(zeta_matrix(Tc2, level_lists), A)
+    Kl = np.exp(-cdist(Z1, Z2, 'sqeuclidean'))
+    return var_f * Kc * Kl
+
+def nll_lmgp(theta, Xc, Tc, y, cont_kernel, d_z, level_lists, jitter=1e-8):
+    """
+    Negative log marginal likelihood for LMGP.
+    theta = [ log(var_f), log(var_n), log(ell[0..d-1]), A.ravel() ]
+    """
+    n, d = Xc.shape
+    # unpack
+    var_f = np.exp(theta[0])
+    var_n = np.exp(theta[1])
+    ell   = np.exp(theta[2:2 + d])
+    A     = theta[2 + d:].reshape(-1, d_z)  # shape (m_total, d_z)
+    # build covariance
+    K = lmgp_kernel(Xc, Tc, Xc, Tc, var_f, A, cont_kernel, ell, level_lists)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    # logdet = 2 sum(log(diag(L)))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return 0.5 * (y.T @ alpha + logdet + n * np.log(2 * np.pi))[0]
+
+def fit_lmgp(Xc, Tc, y, cont_kernel=rbf_kernel, d_z=2, maxiter=800, jitter=1e-8):
+    """
+    Fit LMGP on data (Xc: n×d, Tc: n×J categorical codes, y: (n,1)).
+    Returns a dict with fitted hyperparameters and Cholesky factors.
+    """
+    np.random.seed(0)
+    Xc = np.atleast_2d(Xc)
+    y = y.reshape(-1, 1)
+    # get level lists for each categorical column
+    level_lists = [np.unique(Tc[:, j]) for j in range(Tc.shape[1])]
+    m_total = sum(len(L) for L in level_lists)
+    d = Xc.shape[1]
+    # initial guesses (in log‐space for variances and lengthscales, A random small)
+    var_f0 = 0.1
+    var_n0 = 1e-3
+    ell0   = np.ones(d) * 0.5
+    A0     = 0.01 * np.random.randn(m_total, d_z)
+    theta0 = np.hstack([np.log(var_f0), np.log(var_n0), np.log(ell0), A0.ravel()])
+    # bounds
+    bounds = [(-10, 10)] * 2 + [(-10, 10)] * d + [(-np.inf, np.inf)] * (m_total * d_z)
+    # optimize
+    res = minimize(
+        nll_lmgp, theta0,
+        args=(Xc, Tc, y, cont_kernel, d_z, level_lists, jitter),
+        method='L-BFGS-B', bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    theta_hat = res.x
+    var_f = np.exp(theta_hat[0])
+    var_n = np.exp(theta_hat[1])
+    ell   = np.exp(theta_hat[2:2 + d])
+    A     = theta_hat[2 + d:].reshape(m_total, d_z)
+    # cache train‐train Cholesky and alpha
+    K = lmgp_kernel(Xc, Tc, Xc, Tc, var_f, A, cont_kernel, ell, level_lists)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    L = np.linalg.cholesky(K)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    return {
+        'Xc': Xc, 'Tc': Tc, 'y': y,
+        'var_f': var_f, 'var_n': var_n, 'ell': ell,
+        'A': A, 'L': L, 'alpha': alpha,
+        'k': cont_kernel, 'd_z': d_z, 'jitter': jitter,
+        'levels': level_lists
+    }
+
+def lmgp_predict(model, Xc_star, Tc_star, return_cov=False):
+    """
+    Posterior mean (and optional covariance) for LMGP.
+    Xc_star: (m, d), Tc_star: (m, J)
+    """
+    Xc_star = np.atleast_2d(Xc_star)
+    Tc_star = np.atleast_2d(Tc_star)
+    var_f, var_n, ell, A = (
+        model[k] for k in ['var_f', 'var_n', 'ell', 'A']
+    )
+    cont_kernel, level_lists = model['k'], model['levels']
+    Xc_tr, Tc_tr = model['Xc'], model['Tc']
+    L, alpha, jit = model['L'], model['alpha'], model['jitter']
+    Kxs = lmgp_kernel(Xc_tr, Tc_tr, Xc_star, Tc_star, var_f, A, cont_kernel, ell, level_lists)
+    mu = Kxs.T @ alpha
+    if not return_cov:
+        return mu.squeeze()
+    Kss = lmgp_kernel(Xc_star, Tc_star, Xc_star, Tc_star, var_f, A, cont_kernel, ell, level_lists)
+    v = np.linalg.solve(L, Kxs)
+    cov = Kss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jit
+    return mu.squeeze(), cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+'''
+def multi_start_optimize_lmgp(x0_template, bounds, Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter=1e-8, n_restarts=3):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0_template + np.random.randn(*x0_template.shape) * 0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(
+            nll_lmgp, x0_i,
+            args=(Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter),
+            method='L-BFGS-B', bounds=bounds_template, options={'maxiter':500}
+        )
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lmgp(
+    x0_template, bounds,
+    Xc_tr, Tc_tr, y_tr,
+    cont_kernel, d_z, level_lists,
+    jitter=1e-8
+):
+    # single L-BFGS-B run from the provided x0_template
+    res = minimize(
+        nll_lmgp, x0_template,
+        args=(Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': 500}
+    )
+    return res.x
+
+
+def run_one_simulation_lmgp(rep, cv_splits=5, d_z=2):
+    # 1) Load data
+    df = pd.read_csv("2_correlated_nominal_features_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & levels
+    categorical_cols = ['cat1','cat2']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    T_all = np.vstack(Zs).T
+    level_lists = [np.arange(len(lookups[c])) for c in categorical_cols]
+
+    # 3) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+
+    for tr_idx, te_idx in kf.split(X_all):
+        X_tr, X_te = X_all[tr_idx], X_all[te_idx]
+        y_tr, y_te = y_all[tr_idx], y_all[te_idx]
+        T_tr, T_te = T_all[tr_idx], T_all[te_idx]
+
+        # fit LMGP on this fold
+        model = fit_lmgp(X_tr, T_tr, y_tr,
+                         cont_kernel=rbf_kernel,
+                         d_z=d_z, maxiter=800)
+
+        # predict and score
+        y_pred = lmgp_predict(model, X_te, T_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s.append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LMGP-2correlated nominal features 100 points.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LMGP-2 correlated nominal features 100 points ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lmgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    # overall summary
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+# Four correlated features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+import plotly.graph_objects as go
+from sklearn.metrics import mean_squared_error, r2_score
+import os
+
+def rbf_kernel(x1, x2, var_f, l):
+    """
+    Squared‐exponential (RBF) kernel on continuous inputs.
+    """
+    l = np.array(l)
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+    diff2 = ( (x1[:, None, :] - x2[None, :, :]) ** 2 ) / (2 * l**2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def zeta_matrix(T, level_lists):
+    """
+    One‐hot (grouped) encoding of categorical matrix T.
+    level_lists[j] is array of unique levels (integer codes) for column j.
+    T: shape (n, J). Returns (n, sum(m_j)) dense one‐hot block.
+    """
+    T = np.atleast_2d(T)
+    blocks = []
+    for j, levels in enumerate(level_lists):
+        eye = np.eye(len(levels))
+        mapping = {lvl: eye[i] for i, lvl in enumerate(levels)}
+        blocks.append(np.vstack([mapping[v] for v in T[:, j]]))
+    return np.hstack(blocks)  # shape (n, m_total)
+
+def latent_positions(zeta, A):
+    return zeta @ A  # (n, d_z)
+
+def lmgp_kernel(Xc1, Tc1, Xc2, Tc2, var_f, A, cont_kernel, ell, level_lists):
+    """
+    LMGP covariance: K = var_f · K_cont(Xc1,Xc2) · K_latent(Tc1,Tc2)
+    Where K_latent uses squared‐exp on latent positions Z = ζ·A.
+    """
+    # continuous part
+    Kc = cont_kernel(Xc1, Xc2, 1.0, ell)  # will multiply var_f later
+    # latent part
+    Z1 = latent_positions(zeta_matrix(Tc1, level_lists), A)
+    Z2 = latent_positions(zeta_matrix(Tc2, level_lists), A)
+    Kl = np.exp(-cdist(Z1, Z2, 'sqeuclidean'))
+    return var_f * Kc * Kl
+
+def nll_lmgp(theta, Xc, Tc, y, cont_kernel, d_z, level_lists, jitter=1e-8):
+    """
+    Negative log marginal likelihood for LMGP.
+    theta = [ log(var_f), log(var_n), log(ell[0..d-1]), A.ravel() ]
+    """
+    n, d = Xc.shape
+    # unpack
+    var_f = np.exp(theta[0])
+    var_n = np.exp(theta[1])
+    ell   = np.exp(theta[2:2 + d])
+    A     = theta[2 + d:].reshape(-1, d_z)  # shape (m_total, d_z)
+    # build covariance
+    K = lmgp_kernel(Xc, Tc, Xc, Tc, var_f, A, cont_kernel, ell, level_lists)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    # logdet = 2 sum(log(diag(L)))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return 0.5 * (y.T @ alpha + logdet + n * np.log(2 * np.pi))[0]
+
+def fit_lmgp(Xc, Tc, y, cont_kernel=rbf_kernel, d_z=2, maxiter=800, jitter=1e-8):
+    """
+    Fit LMGP on data (Xc: n×d, Tc: n×J categorical codes, y: (n,1)).
+    Returns a dict with fitted hyperparameters and Cholesky factors.
+    """
+    np.random.seed(0)
+    Xc = np.atleast_2d(Xc)
+    y = y.reshape(-1, 1)
+    # get level lists for each categorical column
+    level_lists = [np.unique(Tc[:, j]) for j in range(Tc.shape[1])]
+    m_total = sum(len(L) for L in level_lists)
+    d = Xc.shape[1]
+    # initial guesses (in log‐space for variances and lengthscales, A random small)
+    var_f0 = 0.1
+    var_n0 = 1e-3
+    ell0   = np.ones(d) * 0.5
+    A0     = 0.01 * np.random.randn(m_total, d_z)
+    theta0 = np.hstack([np.log(var_f0), np.log(var_n0), np.log(ell0), A0.ravel()])
+    # bounds
+    bounds = [(-10, 10)] * 2 + [(-10, 10)] * d + [(-np.inf, np.inf)] * (m_total * d_z)
+    # optimize
+    res = minimize(
+        nll_lmgp, theta0,
+        args=(Xc, Tc, y, cont_kernel, d_z, level_lists, jitter),
+        method='L-BFGS-B', bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    theta_hat = res.x
+    var_f = np.exp(theta_hat[0])
+    var_n = np.exp(theta_hat[1])
+    ell   = np.exp(theta_hat[2:2 + d])
+    A     = theta_hat[2 + d:].reshape(m_total, d_z)
+    # cache train‐train Cholesky and alpha
+    K = lmgp_kernel(Xc, Tc, Xc, Tc, var_f, A, cont_kernel, ell, level_lists)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    L = np.linalg.cholesky(K)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    return {
+        'Xc': Xc, 'Tc': Tc, 'y': y,
+        'var_f': var_f, 'var_n': var_n, 'ell': ell,
+        'A': A, 'L': L, 'alpha': alpha,
+        'k': cont_kernel, 'd_z': d_z, 'jitter': jitter,
+        'levels': level_lists
+    }
+
+def lmgp_predict(model, Xc_star, Tc_star, return_cov=False):
+    """
+    Posterior mean (and optional covariance) for LMGP.
+    Xc_star: (m, d), Tc_star: (m, J)
+    """
+    Xc_star = np.atleast_2d(Xc_star)
+    Tc_star = np.atleast_2d(Tc_star)
+    var_f, var_n, ell, A = (
+        model[k] for k in ['var_f', 'var_n', 'ell', 'A']
+    )
+    cont_kernel, level_lists = model['k'], model['levels']
+    Xc_tr, Tc_tr = model['Xc'], model['Tc']
+    L, alpha, jit = model['L'], model['alpha'], model['jitter']
+    Kxs = lmgp_kernel(Xc_tr, Tc_tr, Xc_star, Tc_star, var_f, A, cont_kernel, ell, level_lists)
+    mu = Kxs.T @ alpha
+    if not return_cov:
+        return mu.squeeze()
+    Kss = lmgp_kernel(Xc_star, Tc_star, Xc_star, Tc_star, var_f, A, cont_kernel, ell, level_lists)
+    v = np.linalg.solve(L, Kxs)
+    cov = Kss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jit
+    return mu.squeeze(), cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+'''
+def multi_start_optimize_lmgp(x0_template, bounds, Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter=1e-8, n_restarts=3):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0_template + np.random.randn(*x0_template.shape) * 0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(
+            nll_lmgp, x0_i,
+            args=(Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter),
+            method='L-BFGS-B', bounds=bounds_template, options={'maxiter':500}
+        )
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lmgp(
+    x0_template, bounds,
+    Xc_tr, Tc_tr, y_tr,
+    cont_kernel, d_z, level_lists,
+    jitter=1e-8
+):
+    # single L-BFGS-B run from the provided x0_template
+    res = minimize(
+        nll_lmgp, x0_template,
+        args=(Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': 500}
+    )
+    return res.x
+
+
+def run_one_simulation_lmgp(rep, cv_splits=5, d_z=2):
+    # 1) Load data
+    df = pd.read_csv("4_correlated_nominal_features_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & levels
+    categorical_cols = ['cat1','cat2','cat3','cat4']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    T_all = np.vstack(Zs).T
+    level_lists = [np.arange(len(lookups[c])) for c in categorical_cols]
+
+    # 3) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+
+    for tr_idx, te_idx in kf.split(X_all):
+        X_tr, X_te = X_all[tr_idx], X_all[te_idx]
+        y_tr, y_te = y_all[tr_idx], y_all[te_idx]
+        T_tr, T_te = T_all[tr_idx], T_all[te_idx]
+
+        # fit LMGP on this fold
+        model = fit_lmgp(X_tr, T_tr, y_tr,
+                         cont_kernel=rbf_kernel,
+                         d_z=d_z, maxiter=800)
+
+        # predict and score
+        y_pred = lmgp_predict(model, X_te, T_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s.append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LMGP-4correlated nominal features 100 points.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LMGP-4 correlated nominal features 100 points ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lmgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    # overall summary
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+# Ten correlated features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def rbf_kernel(x1, x2, var_f, l):
+    """
+    Squared‐exponential (RBF) kernel on continuous inputs.
+    """
+    l = np.array(l)
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+    diff2 = ( (x1[:, None, :] - x2[None, :, :]) ** 2 ) / (2 * l**2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def zeta_matrix(T, level_lists):
+    """
+    One‐hot (grouped) encoding of categorical matrix T.
+    level_lists[j] is array of unique levels (integer codes) for column j.
+    T: shape (n, J). Returns (n, sum(m_j)) dense one‐hot block.
+    """
+    T = np.atleast_2d(T)
+    blocks = []
+    for j, levels in enumerate(level_lists):
+        eye = np.eye(len(levels))
+        mapping = {lvl: eye[i] for i, lvl in enumerate(levels)}
+        blocks.append(np.vstack([mapping[v] for v in T[:, j]]))
+    return np.hstack(blocks)  # shape (n, m_total)
+
+def latent_positions(zeta, A):
+    return zeta @ A  # (n, d_z)
+
+def lmgp_kernel(Xc1, Tc1, Xc2, Tc2, var_f, A, cont_kernel, ell, level_lists):
+    """
+    LMGP covariance: K = var_f · K_cont(Xc1,Xc2) · K_latent(Tc1,Tc2)
+    Where K_latent uses squared‐exp on latent positions Z = ζ·A.
+    """
+    # continuous part
+    Kc = cont_kernel(Xc1, Xc2, 1.0, ell)  # will multiply var_f later
+    # latent part
+    Z1 = latent_positions(zeta_matrix(Tc1, level_lists), A)
+    Z2 = latent_positions(zeta_matrix(Tc2, level_lists), A)
+    Kl = np.exp(-cdist(Z1, Z2, 'sqeuclidean'))
+    return var_f * Kc * Kl
+
+def nll_lmgp(theta, Xc, Tc, y, cont_kernel, d_z, level_lists, jitter=1e-8):
+    """
+    Negative log marginal likelihood for LMGP.
+    theta = [ log(var_f), log(var_n), log(ell[0..d-1]), A.ravel() ]
+    """
+    n, d = Xc.shape
+    # unpack
+    var_f = np.exp(theta[0])
+    var_n = np.exp(theta[1])
+    ell   = np.exp(theta[2:2 + d])
+    A     = theta[2 + d:].reshape(-1, d_z)  # shape (m_total, d_z)
+    # build covariance
+    K = lmgp_kernel(Xc, Tc, Xc, Tc, var_f, A, cont_kernel, ell, level_lists)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    # logdet = 2 sum(log(diag(L)))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return 0.5 * (y.T @ alpha + logdet + n * np.log(2 * np.pi))[0]
+
+def fit_lmgp(Xc, Tc, y, cont_kernel=rbf_kernel, d_z=2, maxiter=800, jitter=1e-8):
+    """
+    Fit LMGP on data (Xc: n×d, Tc: n×J categorical codes, y: (n,1)).
+    Returns a dict with fitted hyperparameters and Cholesky factors.
+    """
+    np.random.seed(0)
+    Xc = np.atleast_2d(Xc)
+    y = y.reshape(-1, 1)
+    # get level lists for each categorical column
+    level_lists = [np.unique(Tc[:, j]) for j in range(Tc.shape[1])]
+    m_total = sum(len(L) for L in level_lists)
+    d = Xc.shape[1]
+    # initial guesses (in log‐space for variances and lengthscales, A random small)
+    var_f0 = 0.1
+    var_n0 = 1e-3
+    ell0   = np.ones(d) * 0.5
+    A0     = 0.01 * np.random.randn(m_total, d_z)
+    theta0 = np.hstack([np.log(var_f0), np.log(var_n0), np.log(ell0), A0.ravel()])
+    # bounds
+    bounds = [(-10, 10)] * 2 + [(-10, 10)] * d + [(-np.inf, np.inf)] * (m_total * d_z)
+    # optimize
+    res = minimize(
+        nll_lmgp, theta0,
+        args=(Xc, Tc, y, cont_kernel, d_z, level_lists, jitter),
+        method='L-BFGS-B', bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    theta_hat = res.x
+    var_f = np.exp(theta_hat[0])
+    var_n = np.exp(theta_hat[1])
+    ell   = np.exp(theta_hat[2:2 + d])
+    A     = theta_hat[2 + d:].reshape(m_total, d_z)
+    # cache train‐train Cholesky and alpha
+    K = lmgp_kernel(Xc, Tc, Xc, Tc, var_f, A, cont_kernel, ell, level_lists)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    L = np.linalg.cholesky(K)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    return {
+        'Xc': Xc, 'Tc': Tc, 'y': y,
+        'var_f': var_f, 'var_n': var_n, 'ell': ell,
+        'A': A, 'L': L, 'alpha': alpha,
+        'k': cont_kernel, 'd_z': d_z, 'jitter': jitter,
+        'levels': level_lists
+    }
+
+def lmgp_predict(model, Xc_star, Tc_star, return_cov=False):
+    """
+    Posterior mean (and optional covariance) for LMGP.
+    Xc_star: (m, d), Tc_star: (m, J)
+    """
+    Xc_star = np.atleast_2d(Xc_star)
+    Tc_star = np.atleast_2d(Tc_star)
+    var_f, var_n, ell, A = (
+        model[k] for k in ['var_f', 'var_n', 'ell', 'A']
+    )
+    cont_kernel, level_lists = model['k'], model['levels']
+    Xc_tr, Tc_tr = model['Xc'], model['Tc']
+    L, alpha, jit = model['L'], model['alpha'], model['jitter']
+    Kxs = lmgp_kernel(Xc_tr, Tc_tr, Xc_star, Tc_star, var_f, A, cont_kernel, ell, level_lists)
+    mu = Kxs.T @ alpha
+    if not return_cov:
+        return mu.squeeze()
+    Kss = lmgp_kernel(Xc_star, Tc_star, Xc_star, Tc_star, var_f, A, cont_kernel, ell, level_lists)
+    v = np.linalg.solve(L, Kxs)
+    cov = Kss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jit
+    return mu.squeeze(), cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+'''
+def multi_start_optimize_lmgp(x0_template, bounds, Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter=1e-8, n_restarts=3):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0_template + np.random.randn(*x0_template.shape) * 0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(
+            nll_lmgp, x0_i,
+            args=(Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter),
+            method='L-BFGS-B', bounds=bounds_template, options={'maxiter':500}
+        )
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lmgp(
+    x0_template, bounds,
+    Xc_tr, Tc_tr, y_tr,
+    cont_kernel, d_z, level_lists,
+    jitter=1e-8
+):
+    # single L-BFGS-B run from the provided x0_template
+    res = minimize(
+        nll_lmgp, x0_template,
+        args=(Xc_tr, Tc_tr, y_tr, cont_kernel, d_z, level_lists, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': 500}
+    )
+    return res.x
+
+
+def run_one_simulation_lmgp(rep, cv_splits=5, d_z=2):
+    # 1) Load data
+    df = pd.read_csv("10_correlated_nominal_features.csv")
+    X_all = df[['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode categories & levels
+    categorical_cols = ['cat1','cat2','cat3','cat4', 'cat5','cat6','cat7','cat8', 'cat9','cat10']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    T_all = np.vstack(Zs).T
+    level_lists = [np.arange(len(lookups[c])) for c in categorical_cols]
+
+    # 3) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+
+    for tr_idx, te_idx in kf.split(X_all):
+        X_tr, X_te = X_all[tr_idx], X_all[te_idx]
+        y_tr, y_te = y_all[tr_idx], y_all[te_idx]
+        T_tr, T_te = T_all[tr_idx], T_all[te_idx]
+
+        # fit LMGP on this fold
+        model = fit_lmgp(X_tr, T_tr, y_tr,
+                         cont_kernel=rbf_kernel,
+                         d_z=d_z, maxiter=800)
+
+        # predict and score
+        y_pred = lmgp_predict(model, X_te, T_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s.append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LMGP-10correlated nominal features.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LMGP-10correlated nominal features ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lmgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    # overall summary
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 10 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
