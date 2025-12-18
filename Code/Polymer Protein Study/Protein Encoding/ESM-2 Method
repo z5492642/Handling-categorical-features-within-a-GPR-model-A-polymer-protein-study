@@ -1,0 +1,135 @@
+!pip -q install transformers accelerate scikit-learn biopython
+
+import re
+import requests
+import numpy as np
+import pandas as pd
+import torch
+
+from sklearn.decomposition import PCA
+from transformers import AutoTokenizer, AutoModel
+
+
+def parse_fasta(fasta_text: str):
+    """Return list of (header, sequence) from FASTA string."""
+    entries = []
+    header = None
+    seq_lines = []
+    for line in fasta_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if header is not None:
+                entries.append((header, "".join(seq_lines)))
+            header = line[1:]
+            seq_lines = []
+        else:
+            seq_lines.append(line)
+    if header is not None:
+        entries.append((header, "".join(seq_lines)))
+    return entries
+
+def fetch_pdb_fasta(pdb_id: str):
+    # RCSB provides FASTA for all chains in an entry
+    url = f"https://www.rcsb.org/fasta/entry/{pdb_id}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return parse_fasta(r.text)
+
+def choose_longest_chain(entries):
+    # simplest robust rule: pick the longest sequence in the FASTA
+    entries = sorted(entries, key=lambda x: len(x[1]), reverse=True)
+    return entries[0]
+
+def fetch_uniprot_fasta_by_query(query: str, size: int = 1):
+    """
+    UniProt REST: returns FASTA. Query syntax is UniProt search syntax.
+    Example query: '(protein_name:"kappa-casein") AND (organism_id:9913) AND reviewed:true'
+    """
+    base = "https://rest.uniprot.org/uniprotkb/search"
+    params = {
+        "query": query,
+        "format": "fasta",
+        "size": size
+    }
+    r = requests.get(base, params=params, timeout=30)
+    r.raise_for_status()
+    entries = parse_fasta(r.text)
+    if not entries:
+        raise ValueError(f"No UniProt FASTA returned for query: {query}")
+    return entries
+
+
+proteins = [
+    {"Protein": "Glucose oxidase",         "PDB": "1CF3"},
+    {"Protein": "Uricase",                 "PDB": "4R8X"},
+    {"Protein": "Trypsin",                 "PDB": "1S81"},
+    {"Protein": "Bovine serum albumin",    "PDB": "4F5S"},
+    {"Protein": "Carbonic anhydrase",      "PDB": "1V9E"},
+    {"Protein": "κ-casein",                "PDB": None},
+]
+
+seq_records = []
+for p in proteins:
+    if p["PDB"]:
+        entries = fetch_pdb_fasta(p["PDB"])
+        header, seq = choose_longest_chain(entries)
+        seq_records.append({"Protein": p["Protein"], "Source": f"PDB:{p['PDB']}", "Header": header, "Sequence": seq})
+    else:
+        # Bos taurus organism_id = 9913; adjust if your κ-casein is from another species.
+        q = '(protein_name:"kappa-casein") AND (organism_id:9913) AND reviewed:true'
+        entries = fetch_uniprot_fasta_by_query(q, size=1)
+        header, seq = entries[0]
+        seq_records.append({"Protein": p["Protein"], "Source": "UniProt:query", "Header": header, "Sequence": seq})
+
+seq_df = pd.DataFrame(seq_records)
+seq_df[["Protein","Source"]]
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_name = "facebook/esm2_t12_35M_UR50D"  # small enough for Colab, decent quality
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False)
+model = AutoModel.from_pretrained(model_name).to(device)
+model.eval()
+
+@torch.no_grad()
+def esm_mean_pooled_embedding(seq: str):
+    # keep only standard amino-acid letters (ESM tokenizers can handle X, but keep clean)
+    seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWYXBZUOJ]", "", seq.upper())
+
+    inputs = tokenizer(seq, return_tensors="pt", add_special_tokens=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    out = model(**inputs)
+    h = out.last_hidden_state  # [1, L, H]
+    attn = inputs["attention_mask"]  # [1, L]
+
+    # exclude special tokens at ends if present (BOS/EOS)
+    if h.shape[1] > 2:
+        h = h[:, 1:-1, :]
+        attn = attn[:, 1:-1]
+
+    attn = attn.unsqueeze(-1)  # [1, L, 1]
+    pooled = (h * attn).sum(dim=1) / attn.sum(dim=1).clamp(min=1.0)
+    return pooled.squeeze(0).cpu().numpy()
+
+embeddings = []
+for _, row in seq_df.iterrows():
+    emb = esm_mean_pooled_embedding(row["Sequence"])
+    embeddings.append(emb)
+
+X = np.vstack(embeddings)  # shape = (6, hidden_dim)
+print("Embedding matrix shape:", X.shape)
+
+
+k = min(6, X.shape[0])   # <= 6 proteins
+pca = PCA(n_components=k, random_state=0)
+X_pca = pca.fit_transform(X)
+
+desc_cols = [f"ESM2_PC{i+1}" for i in range(X_pca.shape[1])]
+desc_df = pd.DataFrame(X_pca, columns=desc_cols)
+desc_df.insert(0, "Protein", seq_df["Protein"].values)
+
+desc_df
