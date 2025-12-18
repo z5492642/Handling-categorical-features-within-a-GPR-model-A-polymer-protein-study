@@ -1,0 +1,1003 @@
+#One nominal Feature
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def rbf_kernel(X1, X2, var_f, ell):
+    ell = np.array(ell)
+    if X1.ndim == 1:
+        X1 = X1.reshape(1, -1)
+    if X2.ndim == 1:
+        X2 = X2.reshape(1, -1)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * ell.reshape(1, 1, -1) ** 2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def lv_kernel_general(X1, Zcs1, X2, Zcs2, var_f, ell, latent_coords_list):
+    # continuous part
+    Kc = rbf_kernel(X1, X2, var_f=1.0, ell=ell)
+    n1, n2 = X1.shape[0], X2.shape[0]
+    Kl = np.ones((n1, n2))
+    # qualitative factors
+    for j, z_coords in enumerate(latent_coords_list):
+        codes1 = Zcs1[j]
+        codes2 = Zcs2[j]
+        Z1_lat = z_coords[codes1]
+        Z2_lat = z_coords[codes2]
+        Zd = cdist(Z1_lat, Z2_lat, 'sqeuclidean')
+        Kl *= np.exp(-Zd)
+    return var_f * Kc * Kl
+
+def nll_lvgp_general(theta, Xc, Zcs, y, b_list, jitter=1e-8):
+    Xc = np.atleast_2d(Xc)
+    n, d = Xc.shape
+    y = y.reshape(n, 1)
+    # unpack
+    idx = 0
+    log_var_f = theta[idx]; idx += 1
+    log_var_n = theta[idx]; idx += 1
+    log_ells  = theta[idx: idx + d]; idx += d
+    var_f = np.exp(log_var_f)
+    var_n = np.exp(log_var_n)
+    ell   = np.exp(log_ells)
+    # latents
+    latent_coords_list = []
+    for m_j in b_list:
+        num_free = 2*m_j - 3
+        flat = theta[idx: idx + num_free]
+        idx += num_free
+        Zc = np.zeros((m_j, 2))
+        if m_j >= 2:
+            Zc[1,0] = flat[0]
+        ptr = 1
+        for lvl in range(2, m_j):
+            Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+            ptr += 2
+        latent_coords_list.append(Zc)
+    # build K
+    K = lv_kernel_general(Xc, Zcs, Xc, Zcs, var_f, ell, latent_coords_list)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # NLL via Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    nll_mat = 0.5 * (y.T @ alpha + logdet + n*np.log(2*np.pi))
+    nll = nll_mat[0,0]
+    return float(nll)
+
+'''
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, n_restarts=3, maxiter=500):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0 + np.random.randn(*x0.shape)*0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(nll_lvgp_general, x0_i,
+                       args=(Xc, Zcs, y, b_list, jitter),
+                       method='L-BFGS-B',
+                       bounds=bounds,
+                       options={'maxiter': maxiter})
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, maxiter=500):
+    # ignore n_restarts, just do one L-BFGS-B run from x0
+    res = minimize(
+        nll_lvgp_general, x0,
+        args=(Xc, Zcs, y, b_list, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    # you can still inspect convergence via res.success or res.message if you like
+    return res.x
+
+
+def lvgp_predict_general(model, Xc_star, Zcs_star, return_cov=False, jitter=1e-8):
+    Xc_tr = model['Xc']
+    Zcs_tr = model['Zcs']
+    var_f = model['var_f']
+    ell   = model['ell']
+    latent_coords_list = model['latent_coords_list']
+    L = model['L']
+    alpha = model['alpha']
+    # cross-cov
+    K_ts = lv_kernel_general(Xc_tr, Zcs_tr, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    mu = (K_ts.T @ alpha).reshape(-1)
+    if not return_cov:
+        return mu
+    # posterior covariance
+    K_ss = lv_kernel_general(Xc_star, Zcs_star, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    v = np.linalg.solve(L, K_ts)
+    cov = K_ss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jitter
+    return mu, cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+def run_one_simulation_lvgp(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("1_nominal_features_low_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode & shapes
+    categorical_cols = ['cat1']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+
+    # 3) Init θ0 & bounds
+    d = X_all.shape[1]
+    total_free = sum((2*m - 3) for m in b_list)
+    theta0 = np.hstack([
+        np.log(0.1),            # log-var_f
+        np.log(1e-3),           # log-var_n
+        np.log(np.ones(d)*0.5), # log-ells
+        np.zeros(total_free)    # latent coords
+    ])
+    bounds = (
+        [(-10,10),(-10,10)] +    # var_f, var_n
+        [(-10,10)]*d +           # each log-ell
+        [(-np.inf,np.inf)]*total_free
+    )
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Zs[i][tr] for i in range(len(b_list))]
+        Z_te = [Zs[i][te] for i in range(len(b_list))]
+
+        # optimise
+        theta_hat = multi_start_optimize_lvgp(
+            theta0, bounds, X_tr, Z_tr, y_tr, b_list
+        )
+
+        # unpack and build model
+        idx = 0
+        var_f = np.exp(theta_hat[idx]); idx+=1
+        var_n = np.exp(theta_hat[idx]); idx+=1
+        ell   = np.exp(theta_hat[idx:idx+d]); idx+=d
+        latent_coords = []
+        for m in b_list:
+            num_free = 2*m - 3
+            flat = theta_hat[idx:idx+num_free]; idx += num_free
+            Zc = np.zeros((m,2))
+            if m>=2:
+                Zc[1,0] = flat[0]
+            ptr = 1
+            for lvl in range(2,m):
+                Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+                ptr += 2
+            latent_coords.append(Zc)
+
+        K_tr = lv_kernel_general(X_tr, Z_tr, X_tr, Z_tr,
+                                 var_f, ell, latent_coords)
+        K_tr[np.diag_indices_from(K_tr)] += var_n + 1e-8
+        L_tr = np.linalg.cholesky(K_tr)
+        alpha_tr = np.linalg.solve(L_tr.T,
+                                  np.linalg.solve(L_tr, y_tr))
+        model = {
+            'Xc': X_tr, 'Zcs': Z_tr,
+            'var_f': var_f, 'ell': ell,
+            'latent_coords_list': latent_coords,
+            'L': L_tr, 'alpha': alpha_tr
+        }
+
+        # predict
+        y_pred = lvgp_predict_general(model, X_te, Z_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s .append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LVGP-1 nominal feature low levels 100 points.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LVGP-1 nominal feature low levels - 100 points ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lvgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+def run_one_simulation_lvgp(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("1_nominal_features_high_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode & shapes
+    categorical_cols = ['cat1']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+
+    # 3) Init θ0 & bounds
+    d = X_all.shape[1]
+    total_free = sum((2*m - 3) for m in b_list)
+    theta0 = np.hstack([
+        np.log(0.1),            # log-var_f
+        np.log(1e-3),           # log-var_n
+        np.log(np.ones(d)*0.5), # log-ells
+        np.zeros(total_free)    # latent coords
+    ])
+    bounds = (
+        [(-10,10),(-10,10)] +    # var_f, var_n
+        [(-10,10)]*d +           # each log-ell
+        [(-np.inf,np.inf)]*total_free
+    )
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Zs[i][tr] for i in range(len(b_list))]
+        Z_te = [Zs[i][te] for i in range(len(b_list))]
+
+        # optimise
+        theta_hat = multi_start_optimize_lvgp(
+            theta0, bounds, X_tr, Z_tr, y_tr, b_list
+        )
+
+        # unpack and build model
+        idx = 0
+        var_f = np.exp(theta_hat[idx]); idx+=1
+        var_n = np.exp(theta_hat[idx]); idx+=1
+        ell   = np.exp(theta_hat[idx:idx+d]); idx+=d
+        latent_coords = []
+        for m in b_list:
+            num_free = 2*m - 3
+            flat = theta_hat[idx:idx+num_free]; idx += num_free
+            Zc = np.zeros((m,2))
+            if m>=2:
+                Zc[1,0] = flat[0]
+            ptr = 1
+            for lvl in range(2,m):
+                Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+                ptr += 2
+            latent_coords.append(Zc)
+
+        K_tr = lv_kernel_general(X_tr, Z_tr, X_tr, Z_tr,
+                                 var_f, ell, latent_coords)
+        K_tr[np.diag_indices_from(K_tr)] += var_n + 1e-8
+        L_tr = np.linalg.cholesky(K_tr)
+        alpha_tr = np.linalg.solve(L_tr.T,
+                                  np.linalg.solve(L_tr, y_tr))
+        model = {
+            'Xc': X_tr, 'Zcs': Z_tr,
+            'var_f': var_f, 'ell': ell,
+            'latent_coords_list': latent_coords,
+            'L': L_tr, 'alpha': alpha_tr
+        }
+
+        # predict
+        y_pred = lvgp_predict_general(model, X_te, Z_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s .append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LVGP-1 nominal feature high levels 100 points.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LVGP-1 nominal feature high levels - 100 points ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lvgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+#Four nominal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def rbf_kernel(X1, X2, var_f, ell):
+    ell = np.array(ell)
+    if X1.ndim == 1:
+        X1 = X1.reshape(1, -1)
+    if X2.ndim == 1:
+        X2 = X2.reshape(1, -1)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * ell.reshape(1, 1, -1) ** 2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def lv_kernel_general(X1, Zcs1, X2, Zcs2, var_f, ell, latent_coords_list):
+    # continuous part
+    Kc = rbf_kernel(X1, X2, var_f=1.0, ell=ell)
+    n1, n2 = X1.shape[0], X2.shape[0]
+    Kl = np.ones((n1, n2))
+    # qualitative factors
+    for j, z_coords in enumerate(latent_coords_list):
+        codes1 = Zcs1[j]
+        codes2 = Zcs2[j]
+        Z1_lat = z_coords[codes1]
+        Z2_lat = z_coords[codes2]
+        Zd = cdist(Z1_lat, Z2_lat, 'sqeuclidean')
+        Kl *= np.exp(-Zd)
+    return var_f * Kc * Kl
+
+def nll_lvgp_general(theta, Xc, Zcs, y, b_list, jitter=1e-8):
+    Xc = np.atleast_2d(Xc)
+    n, d = Xc.shape
+    y = y.reshape(n, 1)
+    # unpack
+    idx = 0
+    log_var_f = theta[idx]; idx += 1
+    log_var_n = theta[idx]; idx += 1
+    log_ells  = theta[idx: idx + d]; idx += d
+    var_f = np.exp(log_var_f)
+    var_n = np.exp(log_var_n)
+    ell   = np.exp(log_ells)
+    # latents
+    latent_coords_list = []
+    for m_j in b_list:
+        num_free = 2*m_j - 3
+        flat = theta[idx: idx + num_free]
+        idx += num_free
+        Zc = np.zeros((m_j, 2))
+        if m_j >= 2:
+            Zc[1,0] = flat[0]
+        ptr = 1
+        for lvl in range(2, m_j):
+            Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+            ptr += 2
+        latent_coords_list.append(Zc)
+    # build K
+    K = lv_kernel_general(Xc, Zcs, Xc, Zcs, var_f, ell, latent_coords_list)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # NLL via Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    nll_mat = 0.5 * (y.T @ alpha + logdet + n*np.log(2*np.pi))
+    nll = nll_mat[0,0]
+    return float(nll)
+
+'''
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, n_restarts=3, maxiter=500):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0 + np.random.randn(*x0.shape)*0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(nll_lvgp_general, x0_i,
+                       args=(Xc, Zcs, y, b_list, jitter),
+                       method='L-BFGS-B',
+                       bounds=bounds,
+                       options={'maxiter': maxiter})
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, maxiter=500):
+    # ignore n_restarts, just do one L-BFGS-B run from x0
+    res = minimize(
+        nll_lvgp_general, x0,
+        args=(Xc, Zcs, y, b_list, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    # you can still inspect convergence via res.success or res.message if you like
+    return res.x
+
+
+def lvgp_predict_general(model, Xc_star, Zcs_star, return_cov=False, jitter=1e-8):
+    Xc_tr = model['Xc']
+    Zcs_tr = model['Zcs']
+    var_f = model['var_f']
+    ell   = model['ell']
+    latent_coords_list = model['latent_coords_list']
+    L = model['L']
+    alpha = model['alpha']
+    # cross-cov
+    K_ts = lv_kernel_general(Xc_tr, Zcs_tr, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    mu = (K_ts.T @ alpha).reshape(-1)
+    if not return_cov:
+        return mu
+    # posterior covariance
+    K_ss = lv_kernel_general(Xc_star, Zcs_star, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    v = np.linalg.solve(L, K_ts)
+    cov = K_ss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jitter
+    return mu, cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+def run_one_simulation_lvgp(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("4_independent_nominal_features_low_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode & shapes
+    categorical_cols = ['cat1','cat2', 'cat3','cat4']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+
+    # 3) Init θ0 & bounds
+    d = X_all.shape[1]
+    total_free = sum((2*m - 3) for m in b_list)
+    theta0 = np.hstack([
+        np.log(0.1),            # log-var_f
+        np.log(1e-3),           # log-var_n
+        np.log(np.ones(d)*0.5), # log-ells
+        np.zeros(total_free)    # latent coords
+    ])
+    bounds = (
+        [(-10,10),(-10,10)] +    # var_f, var_n
+        [(-10,10)]*d +           # each log-ell
+        [(-np.inf,np.inf)]*total_free
+    )
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Zs[i][tr] for i in range(len(b_list))]
+        Z_te = [Zs[i][te] for i in range(len(b_list))]
+
+        # optimise
+        theta_hat = multi_start_optimize_lvgp(
+            theta0, bounds, X_tr, Z_tr, y_tr, b_list
+        )
+
+        # unpack and build model
+        idx = 0
+        var_f = np.exp(theta_hat[idx]); idx+=1
+        var_n = np.exp(theta_hat[idx]); idx+=1
+        ell   = np.exp(theta_hat[idx:idx+d]); idx+=d
+        latent_coords = []
+        for m in b_list:
+            num_free = 2*m - 3
+            flat = theta_hat[idx:idx+num_free]; idx += num_free
+            Zc = np.zeros((m,2))
+            if m>=2:
+                Zc[1,0] = flat[0]
+            ptr = 1
+            for lvl in range(2,m):
+                Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+                ptr += 2
+            latent_coords.append(Zc)
+
+        K_tr = lv_kernel_general(X_tr, Z_tr, X_tr, Z_tr,
+                                 var_f, ell, latent_coords)
+        K_tr[np.diag_indices_from(K_tr)] += var_n + 1e-8
+        L_tr = np.linalg.cholesky(K_tr)
+        alpha_tr = np.linalg.solve(L_tr.T,
+                                  np.linalg.solve(L_tr, y_tr))
+        model = {
+            'Xc': X_tr, 'Zcs': Z_tr,
+            'var_f': var_f, 'ell': ell,
+            'latent_coords_list': latent_coords,
+            'L': L_tr, 'alpha': alpha_tr
+        }
+
+        # predict
+        y_pred = lvgp_predict_general(model, X_te, Z_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s .append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LVGP-4independent nominal features low levels 100 points.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LVGP-4independent nominal features low levels 100 points ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lvgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+def run_one_simulation_lvgp(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("4_independent_nominal_features_high_levels_100.csv")
+    X_all = df[['x1','x2','x3','x4']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode & shapes
+    categorical_cols = ['cat1','cat2', 'cat3','cat4']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+
+    # 3) Init θ0 & bounds
+    d = X_all.shape[1]
+    total_free = sum((2*m - 3) for m in b_list)
+    theta0 = np.hstack([
+        np.log(0.1),            # log-var_f
+        np.log(1e-3),           # log-var_n
+        np.log(np.ones(d)*0.5), # log-ells
+        np.zeros(total_free)    # latent coords
+    ])
+    bounds = (
+        [(-10,10),(-10,10)] +    # var_f, var_n
+        [(-10,10)]*d +           # each log-ell
+        [(-np.inf,np.inf)]*total_free
+    )
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Zs[i][tr] for i in range(len(b_list))]
+        Z_te = [Zs[i][te] for i in range(len(b_list))]
+
+        # optimise
+        theta_hat = multi_start_optimize_lvgp(
+            theta0, bounds, X_tr, Z_tr, y_tr, b_list
+        )
+
+        # unpack and build model
+        idx = 0
+        var_f = np.exp(theta_hat[idx]); idx+=1
+        var_n = np.exp(theta_hat[idx]); idx+=1
+        ell   = np.exp(theta_hat[idx:idx+d]); idx+=d
+        latent_coords = []
+        for m in b_list:
+            num_free = 2*m - 3
+            flat = theta_hat[idx:idx+num_free]; idx += num_free
+            Zc = np.zeros((m,2))
+            if m>=2:
+                Zc[1,0] = flat[0]
+            ptr = 1
+            for lvl in range(2,m):
+                Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+                ptr += 2
+            latent_coords.append(Zc)
+
+        K_tr = lv_kernel_general(X_tr, Z_tr, X_tr, Z_tr,
+                                 var_f, ell, latent_coords)
+        K_tr[np.diag_indices_from(K_tr)] += var_n + 1e-8
+        L_tr = np.linalg.cholesky(K_tr)
+        alpha_tr = np.linalg.solve(L_tr.T,
+                                  np.linalg.solve(L_tr, y_tr))
+        model = {
+            'Xc': X_tr, 'Zcs': Z_tr,
+            'var_f': var_f, 'ell': ell,
+            'latent_coords_list': latent_coords,
+            'L': L_tr, 'alpha': alpha_tr
+        }
+
+        # predict
+        y_pred = lvgp_predict_general(model, X_te, Z_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s .append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LVGP-4independent nominal features high levels 100 points.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LVGP-4independent nominal features high levels 100 points ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lvgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+# Ten nominal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def rbf_kernel(X1, X2, var_f, ell):
+    ell = np.array(ell)
+    if X1.ndim == 1:
+        X1 = X1.reshape(1, -1)
+    if X2.ndim == 1:
+        X2 = X2.reshape(1, -1)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * ell.reshape(1, 1, -1) ** 2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def lv_kernel_general(X1, Zcs1, X2, Zcs2, var_f, ell, latent_coords_list):
+    # continuous part
+    Kc = rbf_kernel(X1, X2, var_f=1.0, ell=ell)
+    n1, n2 = X1.shape[0], X2.shape[0]
+    Kl = np.ones((n1, n2))
+    # qualitative factors
+    for j, z_coords in enumerate(latent_coords_list):
+        codes1 = Zcs1[j]
+        codes2 = Zcs2[j]
+        Z1_lat = z_coords[codes1]
+        Z2_lat = z_coords[codes2]
+        Zd = cdist(Z1_lat, Z2_lat, 'sqeuclidean')
+        Kl *= np.exp(-Zd)
+    return var_f * Kc * Kl
+
+def nll_lvgp_general(theta, Xc, Zcs, y, b_list, jitter=1e-8):
+    Xc = np.atleast_2d(Xc)
+    n, d = Xc.shape
+    y = y.reshape(n, 1)
+    # unpack
+    idx = 0
+    log_var_f = theta[idx]; idx += 1
+    log_var_n = theta[idx]; idx += 1
+    log_ells  = theta[idx: idx + d]; idx += d
+    var_f = np.exp(log_var_f)
+    var_n = np.exp(log_var_n)
+    ell   = np.exp(log_ells)
+    # latents
+    latent_coords_list = []
+    for m_j in b_list:
+        num_free = 2*m_j - 3
+        flat = theta[idx: idx + num_free]
+        idx += num_free
+        Zc = np.zeros((m_j, 2))
+        if m_j >= 2:
+            Zc[1,0] = flat[0]
+        ptr = 1
+        for lvl in range(2, m_j):
+            Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+            ptr += 2
+        latent_coords_list.append(Zc)
+    # build K
+    K = lv_kernel_general(Xc, Zcs, Xc, Zcs, var_f, ell, latent_coords_list)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # NLL via Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    nll_mat = 0.5 * (y.T @ alpha + logdet + n*np.log(2*np.pi))
+    nll = nll_mat[0,0]
+    return float(nll)
+
+'''
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, n_restarts=3, maxiter=500):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0 + np.random.randn(*x0.shape)*0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(nll_lvgp_general, x0_i,
+                       args=(Xc, Zcs, y, b_list, jitter),
+                       method='L-BFGS-B',
+                       bounds=bounds,
+                       options={'maxiter': maxiter})
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, maxiter=500):
+    # ignore n_restarts, just do one L-BFGS-B run from x0
+    res = minimize(
+        nll_lvgp_general, x0,
+        args=(Xc, Zcs, y, b_list, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    # you can still inspect convergence via res.success or res.message if you like
+    return res.x
+
+
+def lvgp_predict_general(model, Xc_star, Zcs_star, return_cov=False, jitter=1e-8):
+    Xc_tr = model['Xc']
+    Zcs_tr = model['Zcs']
+    var_f = model['var_f']
+    ell   = model['ell']
+    latent_coords_list = model['latent_coords_list']
+    L = model['L']
+    alpha = model['alpha']
+    # cross-cov
+    K_ts = lv_kernel_general(Xc_tr, Zcs_tr, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    mu = (K_ts.T @ alpha).reshape(-1)
+    if not return_cov:
+        return mu
+    # posterior covariance
+    K_ss = lv_kernel_general(Xc_star, Zcs_star, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    v = np.linalg.solve(L, K_ts)
+    cov = K_ss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jitter
+    return mu, cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+def run_one_simulation_lvgp(rep, cv_splits=5):
+    # 1) Load data
+    df = pd.read_csv("10_independent_nominal_features.csv")
+    X_all = df[['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']].to_numpy()
+    y_all = df['y'].to_numpy().reshape(-1,1)
+
+    # 2) Encode & shapes
+    categorical_cols = ['cat1','cat2','cat3','cat4', 'cat5','cat6','cat7','cat8', 'cat9','cat10']
+    Zs, lookups = encode_categories(df, categorical_cols)
+    b_list = [len(lookups[col]) for col in categorical_cols]
+
+    # 3) Init θ0 & bounds
+    d = X_all.shape[1]
+    total_free = sum((2*m - 3) for m in b_list)
+    theta0 = np.hstack([
+        np.log(0.1),            # log-var_f
+        np.log(1e-3),           # log-var_n
+        np.log(np.ones(d)*0.5), # log-ells
+        np.zeros(total_free)    # latent coords
+    ])
+    bounds = (
+        [(-10,10),(-10,10)] +    # var_f, var_n
+        [(-10,10)]*d +           # each log-ell
+        [(-np.inf,np.inf)]*total_free
+    )
+
+    # 4) 5-fold CV
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=rep)
+    mses, r2s = [], []
+    for tr, te in kf.split(X_all):
+        X_tr, X_te = X_all[tr], X_all[te]
+        y_tr, y_te = y_all[tr], y_all[te]
+        Z_tr = [Zs[i][tr] for i in range(len(b_list))]
+        Z_te = [Zs[i][te] for i in range(len(b_list))]
+
+        # optimise
+        theta_hat = multi_start_optimize_lvgp(
+            theta0, bounds, X_tr, Z_tr, y_tr, b_list
+        )
+
+        # unpack and build model
+        idx = 0
+        var_f = np.exp(theta_hat[idx]); idx+=1
+        var_n = np.exp(theta_hat[idx]); idx+=1
+        ell   = np.exp(theta_hat[idx:idx+d]); idx+=d
+        latent_coords = []
+        for m in b_list:
+            num_free = 2*m - 3
+            flat = theta_hat[idx:idx+num_free]; idx += num_free
+            Zc = np.zeros((m,2))
+            if m>=2:
+                Zc[1,0] = flat[0]
+            ptr = 1
+            for lvl in range(2,m):
+                Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+                ptr += 2
+            latent_coords.append(Zc)
+
+        K_tr = lv_kernel_general(X_tr, Z_tr, X_tr, Z_tr,
+                                 var_f, ell, latent_coords)
+        K_tr[np.diag_indices_from(K_tr)] += var_n + 1e-8
+        L_tr = np.linalg.cholesky(K_tr)
+        alpha_tr = np.linalg.solve(L_tr.T,
+                                  np.linalg.solve(L_tr, y_tr))
+        model = {
+            'Xc': X_tr, 'Zcs': Z_tr,
+            'var_f': var_f, 'ell': ell,
+            'latent_coords_list': latent_coords,
+            'L': L_tr, 'alpha': alpha_tr
+        }
+
+        # predict
+        y_pred = lvgp_predict_general(model, X_te, Z_te)
+        mses.append(mean_squared_error(y_te, y_pred))
+        r2s .append(r2_score(y_te, y_pred))
+
+    mses = np.array(mses)
+    r2s  = np.array(r2s)
+    se_mse = mses.std(ddof=1) / np.sqrt(len(mses))
+    se_r2  = r2s.std(ddof=1)  / np.sqrt(len(r2s))
+    return mses.mean(), se_mse, r2s.mean(), se_r2
+
+n_reps = 10
+means_mse, ses_mse = [], []
+means_r2 , ses_r2  = [], []
+
+out_path = "LVGP-10independent nominal features.txt"
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for LVGP-10independent nominal features ===\n\n")
+    for rep in range(1, n_reps+1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation_lvgp(rep)
+        means_mse.append(mean_mse); ses_mse.append(se_mse)
+        means_r2 .append(mean_r2); ses_r2 .append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)
+        fout.write(line + "\n")
+
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 100 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1); print(summary2)
+    fout.write(summary1 + "\n"); fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
