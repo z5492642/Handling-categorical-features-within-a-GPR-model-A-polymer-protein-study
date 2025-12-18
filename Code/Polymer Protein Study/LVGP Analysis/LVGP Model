@@ -1,0 +1,509 @@
+# 5-fold cross validation
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def rbf_kernel(X1, X2, var_f, ell):
+    ell = np.array(ell)
+    if X1.ndim == 1:
+        X1 = X1.reshape(1, -1)
+    if X2.ndim == 1:
+        X2 = X2.reshape(1, -1)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * ell.reshape(1, 1, -1) ** 2)
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def lv_kernel_general(X1, Zcs1, X2, Zcs2, var_f, ell, latent_coords_list):
+    # continuous part
+    Kc = rbf_kernel(X1, X2, var_f=1.0, ell=ell)
+    n1, n2 = X1.shape[0], X2.shape[0]
+    Kl = np.ones((n1, n2))
+    # qualitative factors
+    for j, z_coords in enumerate(latent_coords_list):
+        codes1 = Zcs1[j]
+        codes2 = Zcs2[j]
+        Z1_lat = z_coords[codes1]
+        Z2_lat = z_coords[codes2]
+        Zd = cdist(Z1_lat, Z2_lat, 'sqeuclidean')
+        Kl *= np.exp(-Zd)
+    return var_f * Kc * Kl
+
+def nll_lvgp_general(theta, Xc, Zcs, y, b_list, jitter=1e-8):
+    Xc = np.atleast_2d(Xc)
+    n, d = Xc.shape
+    y = y.reshape(n, 1)
+    # unpack
+    idx = 0
+    log_var_f = theta[idx]; idx += 1
+    log_var_n = theta[idx]; idx += 1
+    log_ells  = theta[idx: idx + d]; idx += d
+    var_f = np.exp(log_var_f)
+    var_n = np.exp(log_var_n)
+    ell   = np.exp(log_ells)
+    # latents
+    latent_coords_list = []
+    for m_j in b_list:
+        num_free = 2*m_j - 3
+        flat = theta[idx: idx + num_free]
+        idx += num_free
+        Zc = np.zeros((m_j, 2))
+        if m_j >= 2:
+            Zc[1,0] = flat[0]
+        ptr = 1
+        for lvl in range(2, m_j):
+            Zc[lvl,0] = flat[ptr]; Zc[lvl,1] = flat[ptr+1]
+            ptr += 2
+        latent_coords_list.append(Zc)
+    # build K
+    K = lv_kernel_general(Xc, Zcs, Xc, Zcs, var_f, ell, latent_coords_list)
+    K[np.diag_indices_from(K)] += var_n + jitter
+    # NLL via Cholesky
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    nll_mat = 0.5 * (y.T @ alpha + logdet + n*np.log(2*np.pi))
+    nll = nll_mat[0,0]
+    return float(nll)
+
+'''
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, n_restarts=3, maxiter=500):
+    best_nll = np.inf
+    best_theta = None
+    lower = np.array([b[0] for b in bounds])
+    upper = np.array([b[1] if b[1] is not None else np.inf for b in bounds])
+    for _ in range(n_restarts):
+        x0_i = x0 + np.random.randn(*x0.shape)*0.01
+        x0_i = np.minimum(np.maximum(x0_i, lower), upper)
+        res = minimize(nll_lvgp_general, x0_i,
+                       args=(Xc, Zcs, y, b_list, jitter),
+                       method='L-BFGS-B',
+                       bounds=bounds,
+                       options={'maxiter': maxiter})
+        if res.fun < best_nll:
+            best_nll, best_theta = res.fun, res.x.copy()
+    return best_theta
+'''
+
+def multi_start_optimize_lvgp(x0, bounds, Xc, Zcs, y, b_list,
+                              jitter=1e-8, maxiter=500):
+    # ignore n_restarts, just do one L-BFGS-B run from x0
+    res = minimize(
+        nll_lvgp_general, x0,
+        args=(Xc, Zcs, y, b_list, jitter),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': maxiter}
+    )
+    # you can still inspect convergence via res.success or res.message if you like
+    return res.x
+
+
+def lvgp_predict_general(model, Xc_star, Zcs_star, return_cov=False, jitter=1e-8):
+    Xc_tr = model['Xc']
+    Zcs_tr = model['Zcs']
+    var_f = model['var_f']
+    ell   = model['ell']
+    latent_coords_list = model['latent_coords_list']
+    L = model['L']
+    alpha = model['alpha']
+    # cross-cov
+    K_ts = lv_kernel_general(Xc_tr, Zcs_tr, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    mu = (K_ts.T @ alpha).reshape(-1)
+    if not return_cov:
+        return mu
+    # posterior covariance
+    K_ss = lv_kernel_general(Xc_star, Zcs_star, Xc_star, Zcs_star,
+                             var_f, ell, latent_coords_list)
+    v = np.linalg.solve(L, K_ts)
+    cov = K_ss - v.T @ v
+    cov[np.diag_indices_from(cov)] += jitter
+    return mu, cov
+
+def encode_categories(df, cols):
+    Zs, lookups = [], {}
+    for c in cols:
+        codes, levels = pd.factorize(df[c], sort=True)
+        Zs.append(codes.astype(int))
+        lookups[c] = dict(enumerate(levels))
+    return Zs, lookups
+
+"""
+LVGP version of ‘polymer-peptide binding’ pipeline
+=================================================
+
+*  Fit a latent-variable GP (Zhang et al., 2020) on the full data set
+*  Predict μ and σ² for every polymer–peptide row
+*  Aggregate to polymer-level mean FRET and its s.e.
+*  Produce (and save) the same tables / plots as the Zhou-2011 script
+
+Assumes the helper functions that appear in your original LVGP file
+  - rbf_kernel, lv_kernel_general, nll_lvgp_general, …
+are already defined in the namespace (import them or paste above).
+
+Author: <you>
+"""
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+import pathlib, warnings, sys
+
+# ------------------------------------------------------------------
+# 1.  file locations & column names  (edit if your sheet changes)
+# ------------------------------------------------------------------
+DATA_PATH   = "FRET_Data_Processed_v2_mean_imputed_round3.xlsx"
+POLY_COLS   = ["A", "C", "D", "F", "H", "M", "PEG", "Y"]        # ordinal
+VHSE_COLS   = [f"VHSE{i}" for i in range(1, 9)]                  # continuous
+PEPTIDE_COL = "peptide"                                          # nominal
+RESP_COL    = "FRET"
+POLY_NAME_COL = "POLYMER NAME"
+
+out_dir = pathlib.Path(".")      # everything saved next to script
+out_dir.mkdir(exist_ok=True)
+
+# ------------------------------------------------------------------
+# 2.  load & prepare data
+# ------------------------------------------------------------------
+df = pd.read_excel(DATA_PATH, engine="openpyxl").copy()
+
+df["polymer_name"] = df[POLY_NAME_COL].astype(str)
+
+# ---- continuous block (n × 8)  -----------------------------------
+Xc = df[VHSE_COLS].to_numpy(float)
+y  = df[RESP_COL].to_numpy().reshape(-1, 1)
+
+# ---- ordinal polymer factors  ------------------------------------
+Zcs, b_list = [], []
+for col in POLY_COLS:
+    vals  = df[col].astype(int).to_numpy()
+    codes = vals - vals.min()           # ensure 0 … b-1
+    Zcs.append(codes)
+    b_list.append(codes.max() + 1)
+
+n, d = Xc.shape
+total_latent = sum(2*b - 3 for b in b_list)         # free LV params
+
+# ------------------------------------------------------------------
+# 3.  MLE for LVGP hyper-parameters on FULL data
+# ------------------------------------------------------------------
+theta0 = np.hstack([
+    np.log(1.0),             # log σ_f²
+    np.log(1e-2),            # log σ_n²
+    np.zeros(d) + np.log(0.5),   # log ℓ₁…ℓ_d
+    np.zeros(total_latent)       # latent coords
+])
+
+bounds = (
+    [(-10, 10)] * (2 + d + total_latent)
+)
+
+opt_res = minimize(
+    nll_lvgp_general, theta0,
+    args=(Xc, Zcs, y, b_list),
+    method="L-BFGS-B",
+    bounds=bounds,
+    options=dict(maxiter=800, ftol=1e-8)
+)
+if not opt_res.success:
+    warnings.warn(f"Optimizer stopped with message: {opt_res.message}")
+
+theta_hat = opt_res.x
+
+# ---- unpack MLEs --------------------------------------------------
+idx = 0
+var_f = np.exp(theta_hat[idx]); idx += 1
+var_n = np.exp(theta_hat[idx]); idx += 1
+ell   = np.exp(theta_hat[idx: idx + d]); idx += d
+
+latent_coords = []
+for b in b_list:
+    num_free = 2*b - 3
+    flat = theta_hat[idx: idx + num_free]; idx += num_free
+    Zc = np.zeros((b, 2))
+    if b >= 2:
+        Zc[1, 0] = flat[0]                  # fix level-1 at (0,0); level-2 on x-axis
+    ptr = 1
+    for lvl in range(2, b):
+        Zc[lvl, 0] = flat[ptr];    Zc[lvl, 1] = flat[ptr+1]
+        ptr += 2
+    latent_coords.append(Zc)
+
+# ---- training covariance  K = K(Xc,Z) + σ_n² I -------------------
+K = lv_kernel_general(Xc, Zcs, Xc, Zcs, var_f, ell, latent_coords)
+np.fill_diagonal(K, K.diagonal() + var_n + 1e-8)
+L  = np.linalg.cholesky(K)
+alpha = np.linalg.solve(L.T, np.linalg.solve(L, y))
+
+model = dict(
+    Xc=Xc, Zcs=Zcs, var_f=var_f, ell=ell,
+    latent_coords_list=latent_coords, L=L, alpha=alpha, var_n=var_n
+)
+
+# ------------------------------------------------------------------
+# 4.  predict μ and σ² for *every* observed row
+# ------------------------------------------------------------------
+def lvgp_predict_mu_var(model, Xc_star, Zcs_star):
+    """Return posterior mean and variance (vectors)."""
+    K_ts = lv_kernel_general(model["Xc"], model["Zcs"],
+                             Xc_star, Zcs_star,
+                             model["var_f"], model["ell"],
+                             model["latent_coords_list"])
+    mu = (K_ts.T @ model["alpha"]).ravel()
+
+    v  = np.linalg.solve(model["L"], K_ts)
+    K_ss = lv_kernel_general(Xc_star, Zcs_star, Xc_star, Zcs_star,
+                             model["var_f"], model["ell"],
+                             model["latent_coords_list"])
+    var = np.maximum(0.0,
+                     np.diag(K_ss) - np.sum(v*v, axis=0) + model["var_n"])
+    return mu, var
+
+mu_hat, var_hat = lvgp_predict_mu_var(model, Xc, Zcs)
+df["y_mean"] = mu_hat
+df["y_sd"]   = np.sqrt(var_hat)
+
+# ------------------------------------------------------------------
+# 5.  polymer-level aggregate stats
+# ------------------------------------------------------------------
+poly_stats = (
+    df.groupby("polymer_name")
+      .agg(mean_pred_FRET = ("y_mean", "mean"),
+           se_pred_FRET   = ("y_sd", lambda s: np.sqrt((s**2).mean()/len(s))))
+      .sort_values("mean_pred_FRET", ascending=False)
+)
+
+poly_stats.to_csv(out_dir / "LVGP_polymer_mean_pred_FRET.csv")
+print("Saved ranking → LVGP_polymer_mean_pred_FRET.csv")
+
+top_polymer    = poly_stats.index[0]
+bottom_polymer = poly_stats.index[-1]
+print(f"\n>>> HIGHEST mean predicted FRET: {top_polymer}")
+print(f">>> LOWEST  mean predicted FRET: {bottom_polymer}")
+
+# ------------------------------------------------------------------
+# 6.  quick console preview of top/bottom 10
+# ------------------------------------------------------------------
+print("\n--- Top-10 polymers ------------------------------------------------")
+print(poly_stats.head(10))
+print("\n--- Bottom-10 polymers -------------------------------------------")
+print(poly_stats.tail(10))
+
+# ------------------------------------------------------------------
+# 7.  visualisations  (heat-maps & CI plot)  – optional
+# ------------------------------------------------------------------
+import seaborn as sns, matplotlib.pyplot as plt
+sns.set_theme(style="white")
+# 7-A  heat-map over ALL polymer–peptide combos
+mat = (df.groupby(["polymer_name", PEPTIDE_COL])["y_mean"].mean().unstack(PEPTIDE_COL))
+mat = mat.loc[poly_stats.index]                       # rows sorted best-→worst
+mat = mat[mat.mean(axis=0).sort_values(ascending=False).index]   # peptides
+plt.figure(figsize=(10, max(4, 0.25*len(mat))))
+sns.heatmap(mat.round(3), cmap="rocket_r", cbar_kws=dict(label="Predicted FRET"), linewidths=.5)
+plt.title("predicted FRET for all polymer/protein pairs")
+plt.ylabel("Polymer")
+plt.xlabel("Protein")
+plt.tight_layout()
+#plt.savefig(out_dir / "LVGP_polymer_peptide_heatmap_all.png", dpi=600)
+#plt.close()
+
+# 7-A  heat-map ordered by GOx binding
+# ------------------------------------
+# build polymer × peptide matrix of predicted means
+mat = (
+    df.groupby(["polymer_name", PEPTIDE_COL])["y_mean"]
+      .mean()
+      .unstack(PEPTIDE_COL)
+)
+
+# ---- NEW row ordering: sort by GOx column -------------------------
+# (change "GOx" if your GOx peptide is named differently)
+row_order = mat["GOx"].sort_values(ascending=False).index
+mat = mat.loc[row_order]
+
+# ---- OPTIONAL: keep the previous peptide (column) ordering --------
+# (this line is unchanged – still sorts peptides by overall mean)
+mat = mat[mat.mean(axis=0).sort_values(ascending=False).index]
+
+# ---- plot ---------------------------------------------------------
+plt.figure(figsize=(10, max(4, 0.25 * len(mat))))
+sns.heatmap(
+    mat.round(3),
+    cmap="rocket_r",
+    cbar_kws=dict(label="Predicted FRET"),
+    linewidths=.5
+)
+#plt.title("Predicted FRET for polymer–peptide pairs (rows ordered by GOx binding)")
+plt.ylabel("Polymer")
+plt.xlabel("Protein")
+plt.tight_layout()
+
+# plt.savefig(out_dir / "LVGP_polymer_peptide_heatmap_GOx_order.png", dpi=600)
+# plt.close()
+
+
+# 7-B  point-with-whiskers for top-5 polymers
+top5 = poly_stats.head(10).reset_index()
+top5["pos"] = np.arange(len(top5))
+plt.figure(figsize=(10,8))
+plt.errorbar(top5["pos"], top5["mean_pred_FRET"],
+             yerr=2*top5["se_pred_FRET"], fmt="o",
+             capsize=4, lw=1.2)
+plt.xticks(top5["pos"], top5["polymer_name"], rotation=45, ha="right")
+plt.ylabel("Predicted mean FRET")
+plt.tight_layout()
+#plt.savefig(out_dir / "LVGP_top5_polymer_mean_FRET.png", dpi=300)
+#plt.close()
+#print("Plots saved (heat-map + top-5 CI plot).")
+
+
+
+# 7-B  point-with-whiskers for *all* polymers (horizontal layout)
+all_polys = poly_stats.reset_index()          # keep ranking order
+all_polys["pos"] = np.arange(len(all_polys))  # y-axis positions (0 = best)
+
+fig_h = max(4, 0.22 * len(all_polys))         # scale height to #polymers
+plt.figure(figsize=(10, fig_h))
+
+plt.errorbar(
+    x      = all_polys["mean_pred_FRET"],     # horizontal axis = mean FRET
+    y      = all_polys["pos"],                # vertical positions
+    xerr   = 2 * all_polys["se_pred_FRET"],   # 95 % CI whiskers
+    fmt    = "o",
+    capsize= 4,
+    lw     = 1.2,
+)
+
+plt.yticks(all_polys["pos"], all_polys["polymer_name"])
+plt.xlabel("Predicted mean FRET")
+plt.ylabel("Polymer")
+#plt.title("Predicted mean FRET ± 2 · s.e. for all polymers")
+plt.gca().invert_yaxis()   # optional: keep “best” at top, like the heat-map
+plt.tight_layout()
+
+# plt.savefig(out_dir / "LVGP_all_polymer_mean_FRET.png", dpi=300)
+# plt.close()
+
+
+# assuming all_polys is already sorted best → worst (row 0 = top polymer)
+best_mean  = all_polys.loc[0, "mean_pred_FRET"]   # top polymer’s predicted mean
+best_se    = all_polys.loc[0, "se_pred_FRET"]     # its s.e.
+best_lower = best_mean - 2 * best_se              # lower 95 % bound
+
+# mask for polymers whose upper CI < best polymer's lower CI
+sig_lower = (all_polys["mean_pred_FRET"] + 2 * all_polys["se_pred_FRET"] <
+             best_lower)
+
+fig_h = max(4, 0.22 * len(all_polys))
+plt.figure(figsize=(10, fig_h))
+
+# ---- group 1: NOT significantly different (blue) -----------------
+idx1 = ~sig_lower
+plt.errorbar(
+    x      = all_polys.loc[idx1, "mean_pred_FRET"],
+    y      = all_polys.loc[idx1, "pos"],
+    xerr   = 2 * all_polys.loc[idx1, "se_pred_FRET"],
+    fmt    = "o", color="tab:blue", ecolor="tab:blue",
+    capsize=4, lw=1.2, label="not sig. diff."
+)
+
+# ---- group 2: significantly lower than best (red) ----------------
+idx2 = sig_lower
+plt.errorbar(
+    x      = all_polys.loc[idx2, "mean_pred_FRET"],
+    y      = all_polys.loc[idx2, "pos"],
+    xerr   = 2 * all_polys.loc[idx2, "se_pred_FRET"],
+    fmt    = "o", color="tab:red", ecolor="tab:red",
+    capsize=4, lw=1.2, label="sig. lower"
+)
+
+# reference line at best polymer’s lower bound
+plt.axvline(best_lower, ls="--", lw=1, color="grey",
+            label="best polymer lower bound")
+
+plt.yticks(all_polys["pos"], all_polys["polymer_name"])
+plt.xlabel("Predicted mean FRET")
+plt.ylabel("Polymer")
+#plt.title("Polymers significantly below the best one")
+plt.gca().invert_yaxis()
+#plt.legend(loc="lower right")
+plt.tight_layout()
+
+# plt.savefig(out_dir / "LVGP_all_polymer_mean_FRET_sigdiff.png", dpi=300)
+# plt.close()
+
+
+
+
+# ------------------------------------------------------------------
+# 7-D  inverse plot: lowest → highest binding
+# ------------------------------------------------------------------
+# 1) re-order polymers by ascending mean FRET
+all_polys_low = all_polys.sort_values("mean_pred_FRET").reset_index(drop=True)
+all_polys_low["pos"] = np.arange(len(all_polys_low))   # y-axis positions
+
+# 2) CI of the *worst* polymer (row 0 after sorting)
+worst_mean  = all_polys_low.loc[0, "mean_pred_FRET"]
+worst_se    = all_polys_low.loc[0, "se_pred_FRET"]
+worst_upper = worst_mean + 2 * worst_se                 # reference threshold
+
+# 3) flag polymers whose *lower* CI > worst_upper
+sig_higher = (all_polys_low["mean_pred_FRET"] - 2 * all_polys_low["se_pred_FRET"] >
+              worst_upper)
+
+# 4) plot
+fig_h = max(4, 0.22 * len(all_polys_low))
+plt.figure(figsize=(10, fig_h))
+
+# group 1: NOT significantly higher (blue)
+idx1 = ~sig_higher
+plt.errorbar(
+    x      = all_polys_low.loc[idx1, "mean_pred_FRET"],
+    y      = all_polys_low.loc[idx1, "pos"],
+    xerr   = 2 * all_polys_low.loc[idx1, "se_pred_FRET"],
+    fmt    = "o", color="tab:blue", ecolor="tab:blue",
+    capsize=4, lw=1.2, label="not sig. diff."
+)
+
+# group 2: significantly higher than worst polymer (red)
+idx2 = sig_higher
+plt.errorbar(
+    x      = all_polys_low.loc[idx2, "mean_pred_FRET"],
+    y      = all_polys_low.loc[idx2, "pos"],
+    xerr   = 2 * all_polys_low.loc[idx2, "se_pred_FRET"],
+    fmt    = "o", color="tab:red", ecolor="tab:red",
+    capsize=4, lw=1.2, label="sig. higher"
+)
+
+# vertical reference line at worst_upper
+plt.axvline(worst_upper, ls="--", lw=1, color="grey",
+            label="worst polymer upper bound")
+
+plt.yticks(all_polys_low["pos"], all_polys_low["polymer_name"])
+plt.xlabel("Predicted mean FRET")
+plt.ylabel("Polymer")
+#plt.title("Polymers significantly higher than the lowest one")
+plt.gca().invert_yaxis()        # keeps worst at top (matches label)
+#plt.legend(loc="upper right")
+plt.tight_layout()
+
+# plt.savefig(out_dir / "LVGP_all_polymer_mean_FRET_inverse_sigdiff.png", dpi=300)
+# plt.close()
+
+
+
+
+# ------------------------------------------------------------------
+# 8.  write plain-text summary  ------------------------------------
+with open(out_dir / "LVGP_summary.txt", "w") as fh:
+    fh.write("LVGP model – aggregate polymer results\n")
+    fh.write(poly_stats.to_string(float_format="%.4f"))
+print("Text summary written → LVGP_summary.txt")
+
+
