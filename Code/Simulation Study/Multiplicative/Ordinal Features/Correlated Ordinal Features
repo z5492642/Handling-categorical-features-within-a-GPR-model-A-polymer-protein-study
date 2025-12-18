@@ -1,0 +1,564 @@
+# Two ordinal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fmin_l_bfgs_b
+import os
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def encode_categories(series):
+    """Return integer codes [0..b−1] and a lookup dict {code → level}."""
+    codes, uniques = pd.factorize(series, sort=True)
+    return codes.astype(int), dict(enumerate(uniques))
+
+def angles_to_T(theta, b):
+    L = np.zeros((b, b))
+    L[0, 0] = 1.0
+    idx = 0
+    for r in range(1, b):
+        the = theta[idx: idx + r]
+        idx += r
+        s = 1.0
+        for k in range(r):
+            L[r, k] = s * np.cos(the[k])
+            s *= np.sin(the[k])
+        L[r, r] = s
+    return L @ L.T
+
+def se_kernel(X1, X2, var_f, lengthscales):
+    X1, X2 = np.atleast_2d(X1), np.atleast_2d(X2)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * (lengthscales**2))
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def build_cov(X_pair, Zs_pair, params, shapes):
+    d, ms, bs = shapes['d'], shapes['ms'], shapes['bs']
+    var_f = params[0]
+    l = params[1:1 + d]
+    T_mats = []
+    idx = 1 + d
+    for m_j, b_j in zip(ms, bs):
+        theta_j = params[idx: idx + m_j]
+        idx += m_j
+        T_mats.append(angles_to_T(theta_j, b_j))
+    var_n = params[-1]
+
+    K = se_kernel(X_pair[0], X_pair[1], var_f, l)
+    if T_mats:
+        tau = np.ones_like(K)
+        for T, Z_A, Z_B in zip(T_mats, Zs_pair[0], Zs_pair[1]):
+            tau *= T[Z_A][:, Z_B]
+        K = K * tau
+
+    return K, var_n
+
+def nll(params, X_num, Zs, y, shapes):
+    n = X_num.shape[0]
+    K, var_n = build_cov((X_num, X_num), (Zs, Zs), params, shapes)
+    K[np.diag_indices_from(K)] += var_n
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    a = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.log(np.diag(L)).sum()
+    return 0.5 * (y.T @ a + logdet + n * np.log(2.0 * np.pi))[0]
+
+def gp_predict_mean(params, X_train, Zs_train, X_test, Zs_test, shapes, y_train):
+    Kxx, var_n = build_cov((X_train, X_train), (Zs_train, Zs_train), params, shapes)
+    Kxx[np.diag_indices_from(Kxx)] += var_n
+    L = np.linalg.cholesky(Kxx)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+    Kxs, _ = build_cov((X_train, X_test), (Zs_train, Zs_test), params, shapes)
+    mu = Kxs.T @ alpha
+    return mu.ravel()
+
+def run_one_simulation(rep,n_total=100, d=4,
+                       add_interaction=False):
+    """
+    Instead of simulating, read data from CSV:
+    Assumes /mnt/data/synthetic_dataset.csv has columns
+    x1–x4 (numeric), cat1, cat2 (categorical), and y (response).
+    """
+    # ---- read data from CSV ----
+    df = pd.read_csv("2_correlated_ordinal_features.csv")
+    X_num = df[['x1', 'x2', 'x3', 'x4']].values
+    cat1_series = df['cat1']
+    cat2_series = df['cat2']
+    y = df['y'].values.reshape(-1, 1)
+
+    # ---- encode categories & build shapes ----
+    codes1, lookup1 = encode_categories(cat1_series)
+    codes2, lookup2 = encode_categories(cat2_series)
+    full_codes = {'cat1': codes1, 'cat2': codes2}
+    bs = [len(lookup1), len(lookup2)]
+    ms = [b * (b - 1) // 2 for b in bs]
+    # override d to match the CSV
+    shapes = {'d': X_num.shape[1], 'bs': bs, 'ms': ms}
+
+    # ---- 5-fold CV --------------------------------------------------
+    kf = KFold(n_splits=5, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+
+    for tr_idx, te_idx in kf.split(X_num):
+        X_tr, X_te = X_num[tr_idx], X_num[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+        Zs_tr = [full_codes['cat1'][tr_idx], full_codes['cat2'][tr_idx]]
+        Zs_te = [full_codes['cat1'][te_idx], full_codes['cat2'][te_idx]]
+
+        # ---- hyper-parameter init & optimisation ------------------
+        x0 = np.hstack([
+            1.0,                     # σ_f
+            np.ones(shapes['d']) * 0.5,  # ℓ
+            *([0.5] * sum(shapes['ms'])),# θ
+            0.01                     # σ_n
+        ])
+        bounds = ([(1e-6, None)]               # σ_f
+                  + [(1e-6, None)] * shapes['d']  # ℓ
+                  + [(1e-4, np.pi - 1e-4)] * sum(shapes['ms'])  # θ
+                  + [(1e-6, None)])            # σ_n
+
+        theta_hat, _, _ = fmin_l_bfgs_b(
+            nll, x0,
+            args=(X_tr, Zs_tr, y_tr, shapes),
+            approx_grad=True, bounds=bounds,
+            maxiter=500, factr=1e7, pgtol=1e-8
+        )
+
+        # ---- predict on fold-out set ------------------------------
+        y_pred = gp_predict_mean(theta_hat, X_tr, Zs_tr,
+                                 X_te, Zs_te, shapes, y_tr)
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Multiplicative-2correlated ordinal features 100 points.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Multiplicative-2 correlated ordinal feature 100 points ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 10 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+# Four ordinal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fmin_l_bfgs_b
+import os
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def encode_categories(series):
+    """Return integer codes [0..b−1] and a lookup dict {code → level}."""
+    codes, uniques = pd.factorize(series, sort=True)
+    return codes.astype(int), dict(enumerate(uniques))
+
+def angles_to_T(theta, b):
+    L = np.zeros((b, b))
+    L[0, 0] = 1.0
+    idx = 0
+    for r in range(1, b):
+        the = theta[idx: idx + r]
+        idx += r
+        s = 1.0
+        for k in range(r):
+            L[r, k] = s * np.cos(the[k])
+            s *= np.sin(the[k])
+        L[r, r] = s
+    return L @ L.T
+
+def se_kernel(X1, X2, var_f, lengthscales):
+    X1, X2 = np.atleast_2d(X1), np.atleast_2d(X2)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * (lengthscales**2))
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def build_cov(X_pair, Zs_pair, params, shapes):
+    d, ms, bs = shapes['d'], shapes['ms'], shapes['bs']
+    var_f = params[0]
+    l = params[1:1 + d]
+    T_mats = []
+    idx = 1 + d
+    for m_j, b_j in zip(ms, bs):
+        theta_j = params[idx: idx + m_j]
+        idx += m_j
+        T_mats.append(angles_to_T(theta_j, b_j))
+    var_n = params[-1]
+
+    K = se_kernel(X_pair[0], X_pair[1], var_f, l)
+    if T_mats:
+        tau = np.ones_like(K)
+        for T, Z_A, Z_B in zip(T_mats, Zs_pair[0], Zs_pair[1]):
+            tau *= T[Z_A][:, Z_B]
+        K = K * tau
+
+    return K, var_n
+
+def nll(params, X_num, Zs, y, shapes):
+    n = X_num.shape[0]
+    K, var_n = build_cov((X_num, X_num), (Zs, Zs), params, shapes)
+    K[np.diag_indices_from(K)] += var_n
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    a = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.log(np.diag(L)).sum()
+    return 0.5 * (y.T @ a + logdet + n * np.log(2.0 * np.pi))[0]
+
+def gp_predict_mean(params, X_train, Zs_train, X_test, Zs_test, shapes, y_train):
+    Kxx, var_n = build_cov((X_train, X_train), (Zs_train, Zs_train), params, shapes)
+    Kxx[np.diag_indices_from(Kxx)] += var_n
+    L = np.linalg.cholesky(Kxx)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+    Kxs, _ = build_cov((X_train, X_test), (Zs_train, Zs_test), params, shapes)
+    mu = Kxs.T @ alpha
+    return mu.ravel()
+
+def run_one_simulation(rep,n_total=100, d=4,
+                       add_interaction=False):
+    """
+    Instead of simulating, read data from CSV:
+    Assumes /mnt/data/synthetic_dataset.csv has columns
+    x1–x4 (numeric), cat1, cat2 (categorical), and y (response).
+    """
+    # ---- read data from CSV ----
+    df = pd.read_csv("4_correlated_ordinal_features.csv")
+    X_num = df[['x1', 'x2', 'x3', 'x4']].values
+    cat1_series = df['cat1']
+    cat2_series = df['cat2']
+    cat3_series = df['cat3']
+    cat4_series = df['cat4']
+    y = df['y'].values.reshape(-1, 1)
+
+    # ---- encode categories & build shapes ----
+    codes1, lookup1 = encode_categories(cat1_series)
+    codes2, lookup2 = encode_categories(cat2_series)
+    codes3, lookup3 = encode_categories(cat3_series)
+    codes4, lookup4 = encode_categories(cat4_series)
+    full_codes = {'cat1': codes1, 'cat2': codes2, 'cat3': codes3, 'cat4': codes4}
+    bs = [len(lookup1), len(lookup2), len(lookup3), len(lookup4)]
+    ms = [b * (b - 1) // 2 for b in bs]
+    # override d to match the CSV
+    shapes = {'d': X_num.shape[1], 'bs': bs, 'ms': ms}
+
+    # ---- 5-fold CV --------------------------------------------------
+    kf = KFold(n_splits=5, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+
+    for tr_idx, te_idx in kf.split(X_num):
+        X_tr, X_te = X_num[tr_idx], X_num[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+        Zs_tr = [full_codes['cat1'][tr_idx], full_codes['cat2'][tr_idx], full_codes['cat3'][tr_idx], full_codes['cat4'][tr_idx]]
+        Zs_te = [full_codes['cat1'][te_idx], full_codes['cat2'][te_idx], full_codes['cat3'][te_idx], full_codes['cat4'][te_idx]]
+
+        # ---- hyper-parameter init & optimisation ------------------
+        x0 = np.hstack([
+            1.0,                     # σ_f
+            np.ones(shapes['d']) * 0.5,  # ℓ
+            *([0.5] * sum(shapes['ms'])),# θ
+            0.01                     # σ_n
+        ])
+        bounds = ([(1e-6, None)]               # σ_f
+                  + [(1e-6, None)] * shapes['d']  # ℓ
+                  + [(1e-4, np.pi - 1e-4)] * sum(shapes['ms'])  # θ
+                  + [(1e-6, None)])            # σ_n
+
+        theta_hat, _, _ = fmin_l_bfgs_b(
+            nll, x0,
+            args=(X_tr, Zs_tr, y_tr, shapes),
+            approx_grad=True, bounds=bounds,
+            maxiter=500, factr=1e7, pgtol=1e-8
+        )
+
+        # ---- predict on fold-out set ------------------------------
+        y_pred = gp_predict_mean(theta_hat, X_tr, Zs_tr,
+                                 X_te, Zs_te, shapes, y_tr)
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Multiplicative-4correlated ordinal features 100 points.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Multiplicative-4 correlated ordinal feature 100 points ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 10 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
+
+
+
+
+# Ten ordinal features
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fmin_l_bfgs_b
+import os
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+def encode_categories(series):
+    """Return integer codes [0..b−1] and a lookup dict {code → level}."""
+    codes, uniques = pd.factorize(series, sort=True)
+    return codes.astype(int), dict(enumerate(uniques))
+
+def angles_to_T(theta, b):
+    L = np.zeros((b, b))
+    L[0, 0] = 1.0
+    idx = 0
+    for r in range(1, b):
+        the = theta[idx: idx + r]
+        idx += r
+        s = 1.0
+        for k in range(r):
+            L[r, k] = s * np.cos(the[k])
+            s *= np.sin(the[k])
+        L[r, r] = s
+    return L @ L.T
+
+def se_kernel(X1, X2, var_f, lengthscales):
+    X1, X2 = np.atleast_2d(X1), np.atleast_2d(X2)
+    diff2 = ((X1[:, None, :] - X2[None, :, :]) ** 2) / (2.0 * (lengthscales**2))
+    return var_f * np.exp(-diff2.sum(axis=-1))
+
+def build_cov(X_pair, Zs_pair, params, shapes):
+    d, ms, bs = shapes['d'], shapes['ms'], shapes['bs']
+    var_f = params[0]
+    l = params[1:1 + d]
+    T_mats = []
+    idx = 1 + d
+    for m_j, b_j in zip(ms, bs):
+        theta_j = params[idx: idx + m_j]
+        idx += m_j
+        T_mats.append(angles_to_T(theta_j, b_j))
+    var_n = params[-1]
+
+    K = se_kernel(X_pair[0], X_pair[1], var_f, l)
+    if T_mats:
+        tau = np.ones_like(K)
+        for T, Z_A, Z_B in zip(T_mats, Zs_pair[0], Zs_pair[1]):
+            tau *= T[Z_A][:, Z_B]
+        K = K * tau
+
+    return K, var_n
+
+def nll(params, X_num, Zs, y, shapes):
+    n = X_num.shape[0]
+    K, var_n = build_cov((X_num, X_num), (Zs, Zs), params, shapes)
+    K[np.diag_indices_from(K)] += var_n
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return np.inf
+    a = np.linalg.solve(L.T, np.linalg.solve(L, y))
+    logdet = 2.0 * np.log(np.diag(L)).sum()
+    return 0.5 * (y.T @ a + logdet + n * np.log(2.0 * np.pi))[0]
+
+def gp_predict_mean(params, X_train, Zs_train, X_test, Zs_test, shapes, y_train):
+    Kxx, var_n = build_cov((X_train, X_train), (Zs_train, Zs_train), params, shapes)
+    Kxx[np.diag_indices_from(Kxx)] += var_n
+    L = np.linalg.cholesky(Kxx)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+    Kxs, _ = build_cov((X_train, X_test), (Zs_train, Zs_test), params, shapes)
+    mu = Kxs.T @ alpha
+    return mu.ravel()
+
+def run_one_simulation(rep,n_total=100, d=10,
+                       add_interaction=False):
+    """
+    Instead of simulating, read data from CSV:
+    Assumes /mnt/data/synthetic_dataset.csv has columns
+    x1–x4 (numeric), cat1, cat2 (categorical), and y (response).
+    """
+    # ---- read data from CSV ----
+    df = pd.read_csv("10_correlated_ordinal_features.csv")
+    X_num = df[['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']].values
+    cat1_series = df['cat1']
+    cat2_series = df['cat2']
+    cat3_series = df['cat3']
+    cat4_series = df['cat4']
+    cat5_series = df['cat5']
+    cat6_series = df['cat6']
+    cat7_series = df['cat7']
+    cat8_series = df['cat8']
+    cat9_series = df['cat9']
+    cat10_series = df['cat10']
+    y = df['y'].values.reshape(-1, 1)
+
+    # ---- encode categories & build shapes ----
+    codes1, lookup1 = encode_categories(cat1_series)
+    codes2, lookup2 = encode_categories(cat2_series)
+    codes3, lookup3 = encode_categories(cat3_series)
+    codes4, lookup4 = encode_categories(cat4_series)
+    codes5, lookup5 = encode_categories(cat5_series)
+    codes6, lookup6 = encode_categories(cat6_series)
+    codes7, lookup7 = encode_categories(cat7_series)
+    codes8, lookup8 = encode_categories(cat8_series)
+    codes9, lookup9 = encode_categories(cat9_series)
+    codes10, lookup10 = encode_categories(cat10_series)
+    full_codes = {'cat1': codes1, 'cat2': codes2, 'cat3': codes3, 'cat4': codes4, 'cat5': codes5, 'cat6': codes6, 'cat7': codes7, 'cat8': codes8, 'cat9': codes9, 'cat10': codes10}
+    bs = [len(lookup1), len(lookup2), len(lookup3), len(lookup4), len(lookup5), len(lookup6), len(lookup7), len(lookup8), len(lookup9), len(lookup10)]
+    ms = [b * (b - 1) // 2 for b in bs]
+    # override d to match the CSV
+    shapes = {'d': X_num.shape[1], 'bs': bs, 'ms': ms}
+
+    # ---- 5-fold CV --------------------------------------------------
+    kf = KFold(n_splits=5, shuffle=True, random_state=rep)
+    mse_folds, r2_folds = [], []
+
+    for tr_idx, te_idx in kf.split(X_num):
+        X_tr, X_te = X_num[tr_idx], X_num[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+        Zs_tr = [full_codes['cat1'][tr_idx], full_codes['cat2'][tr_idx], full_codes['cat3'][tr_idx], full_codes['cat4'][tr_idx], full_codes['cat5'][tr_idx], full_codes['cat6'][tr_idx], full_codes['cat7'][tr_idx], full_codes['cat8'][tr_idx], full_codes['cat9'][tr_idx], full_codes['cat10'][tr_idx]]
+        Zs_te = [full_codes['cat1'][te_idx], full_codes['cat2'][te_idx], full_codes['cat3'][te_idx], full_codes['cat4'][te_idx], full_codes['cat5'][te_idx], full_codes['cat6'][te_idx], full_codes['cat7'][te_idx], full_codes['cat8'][te_idx], full_codes['cat9'][te_idx], full_codes['cat10'][te_idx]]
+
+        # ---- hyper-parameter init & optimisation ------------------
+        x0 = np.hstack([
+            1.0,                     # σ_f
+            np.ones(shapes['d']) * 0.5,  # ℓ
+            *([0.5] * sum(shapes['ms'])),# θ
+            0.01                     # σ_n
+        ])
+        bounds = ([(1e-6, None)]               # σ_f
+                  + [(1e-6, None)] * shapes['d']  # ℓ
+                  + [(1e-4, np.pi - 1e-4)] * sum(shapes['ms'])  # θ
+                  + [(1e-6, None)])            # σ_n
+
+        theta_hat, _, _ = fmin_l_bfgs_b(
+            nll, x0,
+            args=(X_tr, Zs_tr, y_tr, shapes),
+            approx_grad=True, bounds=bounds,
+            maxiter=500, factr=1e7, pgtol=1e-8
+        )
+
+        # ---- predict on fold-out set ------------------------------
+        y_pred = gp_predict_mean(theta_hat, X_tr, Zs_tr,
+                                 X_te, Zs_te, shapes, y_tr)
+        mse_folds.append(mean_squared_error(y_te, y_pred))
+        r2_folds .append(r2_score(y_te, y_pred))
+
+    mse_folds, r2_folds = np.array(mse_folds), np.array(r2_folds)
+    return (mse_folds.mean(),
+            mse_folds.std(ddof=1) / np.sqrt(len(mse_folds)),
+            r2_folds.mean(),
+            r2_folds.std(ddof=1) / np.sqrt(len(r2_folds)))
+
+n_reps = 100
+means_mse, ses_mse = [], []
+means_r2, ses_r2 = [], []
+
+# choose your output filename
+out_path = "Multiplicative-10correlated ordinal features.txt"
+
+with open(out_path, "w") as fout:
+
+    fout.write("=== Results for Multiplicative-10correlated ordinal features ===\n\n")
+    # run reps
+    for rep in range(1, n_reps + 1):
+        np.random.seed(rep)
+        mean_mse, se_mse, mean_r2, se_r2 = run_one_simulation(rep)
+        means_mse.append(mean_mse);  ses_mse.append(se_mse)
+        means_r2.append(mean_r2);    ses_r2.append(se_r2)
+
+        line = (f"Rep {rep:2d}: CV MSE = {mean_mse:.5f} ± {se_mse:.5f} (SE),  "
+                f"R² = {mean_r2:.4f} ± {se_r2:.4f} (SE)")
+        print(line)              # still prints to console
+        fout.write(line + "\n")  # writes to cv_results.txt
+
+    # ——— summary across all reps ———
+    means_mse = np.array(means_mse)
+    means_r2  = np.array(means_r2)
+
+    overall_mse_mean = means_mse.mean()
+    overall_mse_se   = means_mse.std(ddof=1) / np.sqrt(n_reps)
+    overall_r2_mean  = means_r2.mean()
+    overall_r2_se    = means_r2.std(ddof=1) / np.sqrt(n_reps)
+
+    fout.write("\nOverall over 10 reps:\n")
+    summary1 = f" MSE mean = {overall_mse_mean:.5f} ± {overall_mse_se:.5f} (SE)"
+    summary2 = f"  R² mean = {overall_r2_mean:.4f} ± {overall_r2_se:.4f} (SE)"
+    print(summary1)
+    print(summary2)
+    fout.write(summary1 + "\n")
+    fout.write(summary2 + "\n")
+
+print(f"\nAll results have been saved to {out_path}")
